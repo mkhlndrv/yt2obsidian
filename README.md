@@ -8,7 +8,17 @@ YouTube URL ──▶ yt-dlp (audio) ──▶ faster-whisper (transcript) ─�
 ```
 
 Everything is in `bot.py`. The note template and the Claude prompts are the
-`NOTE_TEMPLATE`, `SYSTEM_PROMPT`, and `USER_PROMPT` constants at the top of that file.
+`NOTE_TEMPLATE`, `SYSTEM_PROMPT`, `USER_PROMPT`, and `CUE_PROMPT` constants at the top of
+that file, so the note format is a text edit away.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `bot.py` | The whole bot: Telegram handlers, yt-dlp download, faster-whisper transcription, Claude screenshot selection and note writing, file delivery. |
+| `tests/` | Helper tests plus stub-driven tests of the Telegram and Claude layers; no network or API key needed. |
+| `eval/` | Cross-genre evaluation harness: eight real videos through the full pipeline, with cached transcripts and screenshots for fast prompt iteration. |
+| `.env.example` | Every configuration variable with its default. |
 
 ## Setup (Ubuntu)
 
