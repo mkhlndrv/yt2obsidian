@@ -18,6 +18,7 @@ that file, so the note format is a text edit away.
 | `bot.py` | The whole bot: Telegram handlers, yt-dlp download, faster-whisper transcription, Claude screenshot selection and note writing, file delivery. |
 | `tests/` | Helper tests plus stub-driven tests of the Telegram and Claude layers; no network or API key needed. |
 | `eval/` | Cross-genre evaluation harness: eight real videos through the full pipeline, with cached transcripts and screenshots for fast prompt iteration. |
+| `deploy/` | First-boot script for an AWS EC2 instance (see "Deploy on AWS"). |
 | `.env.example` | Every configuration variable with its default. |
 
 ## Setup (Ubuntu)
@@ -142,6 +143,43 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now yt2obsidian
 journalctl -u yt2obsidian -f
 ```
+
+## Deploy on AWS (EC2)
+
+The bot is a single long-running process that polls Telegram, so it wants one small
+always-on Linux VM. It needs no inbound ports at all; all traffic is outbound.
+
+1. **Launch an instance** in the EC2 console: Ubuntu Server 24.04 LTS, 2 vCPU and 4 GB RAM or
+   more (`t4g.medium` on ARM is the cheapest sensible choice and everything here ships ARM
+   wheels; `t3.medium` is the x86 equivalent; the 1 GB free-tier sizes cannot hold the model),
+   a 20 GB disk, a key pair you can SSH with, and a security group that allows SSH from your
+   IP only.
+2. **Paste the first-boot script** from [`deploy/ec2-user-data.sh`](deploy/ec2-user-data.sh)
+   into *Advanced details → User data* before launching. It installs ffmpeg and Python, clones
+   this repo into `/home/ubuntu/yt2obsidian`, installs the requirements, downloads the Whisper
+   model, and registers a systemd service. Give it about five minutes after boot;
+   `sudo tail -f /var/log/cloud-init-output.log` shows progress.
+3. **Configure and start.** SSH in as `ubuntu`, then:
+
+   ```bash
+   cd ~/yt2obsidian
+   cp .env.example .env && nano .env      # bot token, Anthropic key, your Telegram user id
+   chmod 600 .env
+   sudo systemctl start yt2obsidian
+   journalctl -u yt2obsidian -f           # wait for "Bot is running"
+   ```
+
+   The service restarts on failure and starts on boot. If you also run the bot elsewhere,
+   stop that copy first: Telegram lets only one process poll a bot token.
+
+4. **Tune for the instance.** With two vCPUs, expect transcription at roughly realtime (a
+   ten-minute video takes about ten minutes). Setting `WHISPER_CPU_THREADS=2` and
+   `WHISPER_BEAM_SIZE=1` in `.env` speeds it up; a bigger instance speeds it up more.
+
+**Updating:** `cd ~/yt2obsidian && git pull && sudo systemctl restart yt2obsidian`.
+
+**Cost:** a `t4g.medium` runs in the region of $25 a month on-demand and a `t3.medium` about
+$30; the API calls add a few cents per video. Check the EC2 pricing page for your region.
 
 ## Optional: sync the notes folder automatically
 
