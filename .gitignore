@@ -17,3 +17,6 @@ test_vault/
 eval/cache/
 eval/vault/
 eval/results.json
+
+# SSH keys
+*.pem
