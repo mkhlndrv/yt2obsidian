@@ -78,13 +78,23 @@ that file, so the note format is a text edit away.
 ## Using it
 
 Send the bot any YouTube video link (`youtube.com/watch?v=…`, `youtu.be/…`, Shorts, or
-`/live/` links of finished streams). It replies at each step:
+`/live/` links of finished streams). It posts one status message and updates it in place as
+the job progresses:
 
-1. "Processing started" as soon as the link is accepted.
-2. Video title and length once the audio is downloaded.
-3. Word count once transcription is done.
-4. The finished note as a `.md` file attached to the chat. A copy is also kept in the
-   notes folder on the bot's machine.
+```
+Processing
+How does raising interest rates control inflation? (8:14)
+
+Downloaded
+Transcribed — 1,202 words
+Screenshots — 2
+Writing note…
+```
+
+The header turns into `Done` with a final line (`Note added to vault: …` when an upload
+command is configured, `Note saved: …` otherwise), or `Failed` with the reason. With
+`SEND_NOTE_FILE=true` the finished `.md` file is attached to the chat as well. A copy of
+every note is kept in the notes folder on the bot's machine.
 
 The note has a summary, key takeaways, timestamped sections that follow the video's own
 structure (each heading and quote links to that moment on YouTube), things worth following

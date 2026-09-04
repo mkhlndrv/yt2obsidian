@@ -983,10 +983,10 @@ def run_after_note_command(path: Path) -> None:
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=600)
     except subprocess.TimeoutExpired as exc:
-        raise PipelineError(f"AFTER_NOTE_COMMAND timed out after 600s: {command}") from exc
+        raise PipelineError("Vault upload timed out after 600 s") from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()[:300]
-        raise PipelineError(f"AFTER_NOTE_COMMAND failed (exit {result.returncode}): {detail}")
+        raise PipelineError(f"Vault upload failed (exit {result.returncode}): {detail}")
     log.info("AFTER_NOTE_COMMAND ran for %s", path.name)
 
 
@@ -1004,9 +1004,8 @@ def _is_allowed(update: Update) -> bool:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     await update.effective_message.reply_text(
-        "Send me a YouTube link and I'll transcribe it and send you back a structured "
-        f"Obsidian note as a .md file.\n\nYour Telegram user id is {user.id if user else 'unknown'} "
-        "(use it for TELEGRAM_ALLOWED_USER_IDS in .env)."
+        "Send a YouTube link to get a structured note for your vault.\n\n"
+        f"Your Telegram user id: {user.id if user else 'unknown'}"
     )
 
 
@@ -1017,87 +1016,165 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not _is_allowed(update):
         uid = update.effective_user.id if update.effective_user else "?"
         log.warning("Ignoring message from unauthorized user id %s", uid)
-        await message.reply_text("Sorry, this bot is private.")
+        await message.reply_text("This bot is private.")
         return
 
     video_id = extract_video_id(message.text or "")
     if not video_id:
-        await message.reply_text(
-            "That doesn't look like a YouTube link. Send a youtube.com or youtu.be video URL."
-        )
+        await message.reply_text("Not a YouTube link. Send a youtube.com or youtu.be video URL.")
         return
 
-    await message.reply_text(
-        "Processing started: downloading audio, then transcribing. "
-        "Long videos can take a while; I'll message you at each step."
-    )
-    # Hand the heavy work to a background task so the handler (and the bot) stays responsive.
+    # Hand the heavy work to a background task so the handler (and the bot) stays responsive;
+    # the task posts one status message and updates it as the job progresses.
     context.application.create_task(
         process_video(video_id, message.chat_id, context), update=update
     )
 
 
-async def process_video(video_id: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    async def say(text: str) -> None:
-        await context.bot.send_message(chat_id=chat_id, text=text)
+class JobStatus:
+    """One Telegram message per job, edited in place as the job progresses.
 
+    Rendered as:  <header>            (Processing / Done / Failed)
+                  <title> (<length>)
+                  <blank line>
+                  <one line per completed step, the last one may be pending with an ellipsis>
+    """
+
+    def __init__(self, bot, chat_id: int) -> None:
+        self.bot = bot
+        self.chat_id = chat_id
+        self.message_id: int | None = None
+        self.header = "Processing"
+        self.title: str | None = None
+        self.lines: list[str] = []
+        self.pending = False  # the last line is an in-progress step
+        self._last_text = ""
+
+    def _render(self) -> str:
+        lines = list(self.lines)
+        if self.pending and lines:
+            lines[-1] += "…"
+        head = self.header + (f"\n{self.title}" if self.title else "")
+        return head + ("\n\n" + "\n".join(lines) if lines else "")
+
+    async def _push(self) -> None:
+        text = self._render()
+        if text == self._last_text:
+            return
+        self._last_text = text
+        try:
+            if self.message_id is None:
+                raise TelegramError("no message yet")
+            await self.bot.edit_message_text(chat_id=self.chat_id, message_id=self.message_id, text=text)
+        except TelegramError:
+            message = await self.bot.send_message(chat_id=self.chat_id, text=text)
+            self.message_id = message.message_id
+
+    async def start(self, pending_step: str) -> None:
+        self.lines, self.pending = [pending_step], True
+        await self._push()
+
+    async def pending_step(self, text: str) -> None:
+        """Add an in-progress step (replaces a previous pending one)."""
+        if self.pending:
+            self.lines[-1] = text
+        else:
+            self.lines.append(text)
+        self.pending = True
+        await self._push()
+
+    async def step(self, text: str) -> None:
+        """Complete the pending step with its final wording, or add a finished step."""
+        if self.pending:
+            self.lines[-1] = text
+        else:
+            self.lines.append(text)
+        self.pending = False
+        await self._push()
+
+    async def drop_pending(self) -> None:
+        if self.pending:
+            self.lines.pop()
+            self.pending = False
+        await self._push()
+
+    async def finish(self, text: str) -> None:
+        self.header = "Done"
+        await self.step(text)
+
+    async def fail(self, reason: str) -> None:
+        self.header = "Failed"
+        await self.step(reason)
+
+
+async def process_video(video_id: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    status = JobStatus(context.bot, chat_id)
     log.info("Job started for video %s", video_id)
     try:
+        await status.start("Downloading")
         with tempfile.TemporaryDirectory(prefix="yt2obsidian-") as tmp:
             meta, audio_path = await asyncio.to_thread(download_audio, video_id, Path(tmp))
-            await say(f"Downloaded “{meta.title}” ({meta.duration_str}). Transcribing…")
+            status.title = f"{meta.title} ({meta.duration_str})"
+            await status.step("Downloaded")
 
             if TRANSCRIBE_LOCK.locked():
-                await say("Another video is still being transcribed; yours is queued behind it.")
+                await status.pending_step("Queued behind another video")
             async with TRANSCRIBE_LOCK:
+                await status.pending_step("Transcribing")
                 segments = await asyncio.to_thread(transcribe_audio, audio_path, meta.video_id)
             transcript = format_transcript(segments, meta.video_id)
+            await status.step(f"Transcribed — {transcript_word_count(transcript):,} words")
 
             # Screenshots only at the moments Claude picks; skip the video download when there are none.
             frames: list[Frame] = []
             cues = await find_screen_cues(segments, meta) if INCLUDE_FRAMES else []
             if cues:
+                await status.pending_step("Selecting screenshots")
                 video_path = await asyncio.to_thread(download_video_stream, video_id, Path(tmp))
                 if video_path is not None:
                     try:
                         frames = await asyncio.to_thread(extract_frames, video_path, meta, Path(tmp), cues)
                     except Exception as exc:  # screenshots are optional
                         log.warning("Screenshot extraction failed; continuing without: %s", exc)
+                if frames:
+                    await status.step(f"Screenshots — {len(frames)}")
+                else:
+                    await status.drop_pending()
         # Leaving the `with` block deletes the temp directory with the audio, video, and frames.
 
-        shots = f" and {len(frames)} screenshot{'s' if len(frames) != 1 else ''}" if frames else ""
-        await say(f"Transcribed {transcript_word_count(transcript):,} words{shots}. Asking Claude to write the note…")
+        await status.pending_step("Writing note")
         note = await generate_note(meta, transcript, frames)
         if INCLUDE_TRANSCRIPT:
             note = append_transcript(note, transcript)
         path = await asyncio.to_thread(write_note, note, meta)
+
+        result = f"Note saved: {path.stem}"
         if AFTER_NOTE_COMMAND:
             try:
                 await asyncio.to_thread(run_after_note_command, path)
+                result = f"Note added to vault: {path.stem}"
             except PipelineError as exc:
                 log.warning("%s", exc)
-                await say(f"⚠️ {exc}")
-        if not SEND_NOTE_FILE:
-            await say(f"✅ Note saved: {path.stem}")
-        else:
+                await status.step(str(exc))
+                result = f"Note kept on the server: {path.name}"
+        await status.finish(result)
+
+        if SEND_NOTE_FILE:
             try:
                 await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=path.read_bytes(),
-                    filename=path.name,
-                    caption=f"✅ {path.stem}\nSave this file into your Obsidian vault.",
+                    chat_id=chat_id, document=path.read_bytes(), filename=path.name, caption=path.stem
                 )
             except TelegramError as exc:
                 log.warning("Could not send the note file to Telegram: %s", exc)
-                await say(f"⚠️ The note was saved at {path}, but sending the file failed: {exc}")
+                await status.step(f"Sending the file failed: {exc}. The note is at {path}")
         log.info("Job finished for video %s", video_id)
 
     except PipelineError as exc:
         log.warning("Job failed for video %s: %s", video_id, exc)
-        await say(f"❌ {exc}")
+        await status.fail(str(exc))
     except Exception as exc:  # noqa: BLE001 - last resort: never fail silently
         log.exception("Unexpected error while processing video %s", video_id)
-        await say(f"❌ Unexpected error ({exc.__class__.__name__}): {exc}")
+        await status.fail(f"Unexpected error ({exc.__class__.__name__}): {exc}")
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1110,7 +1187,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = getattr(update, "effective_message", None)
     if message is not None:
         try:
-            await message.reply_text(f"❌ Unexpected error ({err.__class__.__name__}): {err}")
+            await message.reply_text(f"Unexpected error ({err.__class__.__name__}): {err}")
         except TelegramError:
             pass
 

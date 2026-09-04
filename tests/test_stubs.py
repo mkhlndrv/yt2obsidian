@@ -136,21 +136,25 @@ async def main():
     print("generate_note error mapping OK")
 
     # --- Telegram handlers with a fake update/context ------------------------
-    replies, sent, tasks, docs = [], [], [], []
+    replies, sent, tasks, docs, edits = [], [], [], [], []
     async def reply_text(t): replies.append(t)
-    async def send_message(chat_id, text): sent.append((chat_id, text))
+    async def send_message(chat_id, text): sent.append((chat_id, text)); return types.SimpleNamespace(message_id=len(sent))
+    async def edit_message_text(chat_id, message_id, text): edits.append((message_id, text))
     async def send_document(chat_id, document, filename, caption): docs.append((chat_id, document, filename, caption))
     def create_task(coro, update=None): tasks.append(coro)
     def mk_update(text, uid=42):
         msg = types.SimpleNamespace(text=text, chat_id=7, reply_text=reply_text)
         return types.SimpleNamespace(effective_message=msg, effective_user=types.SimpleNamespace(id=uid))
-    ctx = types.SimpleNamespace(bot=types.SimpleNamespace(send_message=send_message, send_document=send_document),
+    ctx = types.SimpleNamespace(bot=types.SimpleNamespace(send_message=send_message, edit_message_text=edit_message_text,
+                                                          send_document=send_document),
                                 application=types.SimpleNamespace(create_task=create_task))
+    def status(): return edits[-1][1]   # the job's status message as last edited
 
     await bot.handle_message(mk_update("hi there"), ctx)
-    assert "doesn't look like a YouTube link" in replies[-1] and not tasks
+    assert replies[-1] == "Not a YouTube link. Send a youtube.com or youtu.be video URL." and not tasks
+    n_replies = len(replies)
     await bot.handle_message(mk_update("https://youtu.be/dQw4w9WgXcQ"), ctx)
-    assert "Processing started" in replies[-1] and len(tasks) == 1
+    assert len(tasks) == 1 and len(replies) == n_replies   # no chatter: the job's own status message does the talking
     tasks[-1].close()
     print("handle_message routing OK")
 
@@ -161,7 +165,7 @@ async def main():
     print("authorization OK")
 
     await bot.cmd_start(mk_update("/start"), ctx)
-    assert "user id is 42" in replies[-1]
+    assert replies[-1].endswith("Your Telegram user id: 42"), replies[-1]
     print("cmd_start OK")
 
     from telegram.error import NetworkError as NE, TimedOut
@@ -170,18 +174,19 @@ async def main():
     await bot.on_error(None, types.SimpleNamespace(error=TimedOut()))          # subclass of NetworkError
     assert len(replies) == n
     await bot.on_error(mk_update("x"), types.SimpleNamespace(error=RuntimeError("bad")))
-    assert replies[-1] == "❌ Unexpected error (RuntimeError): bad", replies[-1]
+    assert replies[-1] == "Unexpected error (RuntimeError): bad", replies[-1]
     print("on_error OK")
 
     # process_video: download failure surfaces as a clear message, nothing else runs
     def boom(*a, **k): raise bot.PipelineError("Could not download the video: Video unavailable")
     bot.download_audio = boom
     await bot.process_video("dQw4w9WgXcQ", 7, ctx)
-    assert sent[-1] == (7, "❌ Could not download the video: Video unavailable"), sent
+    assert sent[-1] == (7, "Processing\n\nDownloading…"), sent[-1]
+    assert status() == "Failed\n\nCould not download the video: Video unavailable", status()
     def crash(*a, **k): raise RuntimeError("weird")
     bot.download_audio = crash
     await bot.process_video("dQw4w9WgXcQ", 7, ctx)
-    assert sent[-1][1].startswith("❌ Unexpected error (RuntimeError): weird"), sent
+    assert status() == "Failed\n\nUnexpected error (RuntimeError): weird", status()
     print("process_video error reporting OK")
 
     # process_video full flow with stubbed steps -> file written, stage messages sent
@@ -197,10 +202,10 @@ async def main():
     bot._anthropic_client, _ = fake_client(fake_message(note_text))
     n_before = len(sent)
     await bot.process_video("dQw4w9WgXcQ", 7, ctx)
-    msgs = [t for _, t in sent[n_before:]]
-    assert len(msgs) == 2 and msgs[0].startswith("Downloaded “A Talk” (1:05)") and msgs[1].startswith("Transcribed 3 words"), msgs
+    assert len(sent) == n_before + 1, "exactly one status message per job"
+    assert status() == "Done\nA Talk (1:05)\n\nDownloaded\nTranscribed — 3 words\nNote saved: A Talk", status()
     assert (v / "A Talk.md").read_text() == note_text + "\n"
-    assert docs == [(7, (note_text + "\n").encode(), "A Talk.md", "✅ A Talk\nSave this file into your Obsidian vault.")], docs
+    assert docs == [(7, (note_text + "\n").encode(), "A Talk.md", "A Talk")], docs
     assert seen["audio_existed"] and not seen["path"].exists(), "temp audio not deleted"
     assert seen["vid"] == "dQw4w9WgXcQ"
     print("process_video full flow OK (temp audio deleted, note written, file sent)")
@@ -224,21 +229,21 @@ async def main():
     bot.download_video_stream = fake_video; bot.extract_frames = fake_frames; bot.find_screen_cues = no_cues
     bot._anthropic_client, captured = fake_client(fake_message(note_text))
     await bot.process_video("dQw4w9WgXcQ", 7, ctx)
-    assert calls == [] and sent[-1][1].startswith("Transcribed 3 words. Asking Claude"), (calls, sent[-1])
+    assert calls == [] and status().startswith("Done") and "Screenshots" not in status(), (calls, status())
     # with a picked moment: video stream + frame at that moment, Claude receives the image, message counts it
     async def one_cue(segments, m): return [(12.0, "the code")]
     bot.find_screen_cues = one_cue
     bot._anthropic_client, captured = fake_client(fake_message(note_text))
     await bot.process_video("dQw4w9WgXcQ", 7, ctx)
     assert calls == ["video", ("frames", [(12.0, "the code")])], calls
-    assert sent[-1][1].startswith("Transcribed 3 words and 1 screenshot."), sent[-1]
+    assert "\nScreenshots — 1\n" in status() and status().startswith("Done"), status()
     assert any(c["type"] == "image" for c in captured["messages"][0]["content"])
     # frame extraction failure must not lose the note
     def broken_frames(vp, m, out_dir, cues): raise RuntimeError("ffmpeg missing")
     bot.extract_frames = broken_frames
     bot._anthropic_client, captured = fake_client(fake_message(note_text))
     await bot.process_video("dQw4w9WgXcQ", 7, ctx)
-    assert sent[-1][1].startswith("Transcribed 3 words. Asking Claude"), sent[-1]
+    assert status().startswith("Done") and "Screenshots" not in status(), status()
     assert (v / "A Talk (5).md").exists()
     bot.INCLUDE_FRAMES = False
     print("frames flow OK (Claude-gated, image sent, extraction failure tolerated)")
@@ -248,7 +253,7 @@ async def main():
     bot.SEND_NOTE_FILE = False
     bot._anthropic_client, _ = fake_client(fake_message(note_text))
     await bot.process_video("dQw4w9WgXcQ", 7, ctx)
-    assert sent[-1][1].startswith("✅ Note saved: A Talk") and len(docs) == n_docs, (sent[-1], len(docs) - n_docs)
+    assert "\nNote saved: A Talk" in status() and status().startswith("Done") and len(docs) == n_docs, (status(), len(docs) - n_docs)
     bot.SEND_NOTE_FILE = True
     print("SEND_NOTE_FILE=false OK")
 
@@ -258,11 +263,11 @@ async def main():
     bot._anthropic_client, _ = fake_client(fake_message(note_text))
     await bot.process_video("dQw4w9WgXcQ", 7, ctx)
     assert marker.read_text() == note_text + "\n", marker.read_text()[:80]
-    assert not sent[-1][1].startswith("⚠️"), sent[-1]
+    assert "\nNote added to vault: A Talk" in status() and "failed" not in status(), status()
     bot.AFTER_NOTE_COMMAND = "exit 3"
     bot._anthropic_client, _ = fake_client(fake_message(note_text))
     await bot.process_video("dQw4w9WgXcQ", 7, ctx)
-    assert any(t.startswith("⚠️ AFTER_NOTE_COMMAND failed (exit 3)") for _, t in sent[-2:]), sent[-2:]
+    assert "\nVault upload failed (exit 3)" in status() and "\nNote kept on the server: A Talk" in status(), status()
     assert docs[-1][2].startswith("A Talk"), docs[-1][2]   # the file was still delivered
     bot.AFTER_NOTE_COMMAND = ""
     print("AFTER_NOTE_COMMAND OK")
@@ -273,7 +278,7 @@ async def main():
     ctx.bot.send_document = bad_send_document
     n_files = len(list(v.glob("A Talk*.md")))
     await bot.process_video("dQw4w9WgXcQ", 7, ctx)
-    assert sent[-1][1].startswith("⚠️ The note was saved at") and "boom" in sent[-1][1], sent[-1]
+    assert status().startswith("Done") and "Sending the file failed: boom" in status(), status()
     assert len(list(v.glob("A Talk*.md"))) == n_files + 1
     shutil.rmtree(v)
     print("send_document failure path OK")
