@@ -20,3 +20,7 @@ eval/results.json
 
 # SSH keys
 *.pem
+
+# YouTube cookies for yt-dlp
+cookies.txt
+*cookies*.txt
