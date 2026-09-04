@@ -1,85 +1,20 @@
 # yt2obsidian
 
-A personal Telegram bot: send it a YouTube link, get back a structured Obsidian note as a
-`.md` file in the same chat.
+Send a YouTube link to a Telegram bot; get a structured Obsidian note in your vault, without
+watching the video.
 
 ```
-YouTube URL ──▶ yt-dlp (audio) ──▶ faster-whisper (transcript) ──▶ Claude (note) ──▶ <title>.md in Telegram
+YouTube URL ──▶ audio (yt-dlp) ──▶ transcript (Whisper) ──▶ screenshots of the moments that
+matter (Claude picks them) ──▶ note (Claude) ──▶ .md in your vault (or in the chat)
 ```
 
-Everything is in `bot.py`. The note template and the Claude prompts are the
-`NOTE_TEMPLATE`, `SYSTEM_PROMPT`, `USER_PROMPT`, and `CUE_PROMPT` constants at the top of
-that file, so the note format is a text edit away.
+The note is built to replace watching: a summary, key takeaways, notes organised by topic with
+links back to the exact moment in the video, code and slide text pulled from screenshots,
+things worth following up, quotes, wikilinks into your vault, and the full timestamped
+transcript folded at the bottom so the whole video is searchable. See
+[`examples/Rust in 100 Seconds.md`](examples/Rust%20in%20100%20Seconds.md) for a real one.
 
-## Layout
-
-| Path | What |
-|---|---|
-| `bot.py` | The whole bot: Telegram handlers, yt-dlp download, faster-whisper transcription, Claude screenshot selection and note writing, file delivery. |
-| `tests/` | Helper tests plus stub-driven tests of the Telegram and Claude layers; no network or API key needed. |
-| `eval/` | Cross-genre evaluation harness: eight real videos through the full pipeline, with cached transcripts and screenshots for fast prompt iteration. |
-| `deploy/` | First-boot script for an AWS EC2 instance, and the Obsidian-on-the-server installer for Obsidian Sync. |
-| `.env.example` | Every configuration variable with its default. |
-
-## Setup (Ubuntu)
-
-1. **System packages.** `ffmpeg` is required by yt-dlp (and used for audio decoding).
-
-   ```bash
-   sudo apt update
-   sudo apt install -y ffmpeg python3 python3-venv python3-pip
-   python3 --version   # needs 3.11 or newer
-   ```
-
-2. **Python environment.**
-
-   ```bash
-   cd video_transcript
-   python3 -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
-
-   The `yt-dlp[default,deno]` line pulls in the JavaScript runtime that yt-dlp now needs
-   for YouTube (it lands in `.venv/bin/deno`, no system-wide install required).
-
-3. **Telegram bot token.** Message [@BotFather](https://t.me/BotFather), run `/newbot`,
-   and copy the token it gives you.
-
-4. **Anthropic API key.** Create one at <https://console.anthropic.com/>.
-
-5. **Config.** Copy the example file and fill it in:
-
-   ```bash
-   cp .env.example .env
-   nano .env
-   ```
-
-   | Variable | Meaning |
-   | --- | --- |
-   | `TELEGRAM_BOT_TOKEN` | Token from BotFather |
-   | `ANTHROPIC_API_KEY` | Anthropic API key |
-   | `OBSIDIAN_VAULT_PATH` | Optional. Folder where a copy of every note is kept (default `notes/` next to `bot.py`). Point it inside your vault if the bot runs on the machine that has the vault. |
-   | `TELEGRAM_ALLOWED_USER_IDS` | Your Telegram user id(s). Send `/start` to the bot to see yours. Empty means anyone can use the bot. |
-
-   Optional overrides (`CLAUDE_MODEL`, `WHISPER_MODEL`, `WHISPER_DEVICE`,
-   `WHISPER_COMPUTE_TYPE`, `MAX_VIDEO_MINUTES`, `YTDLP_COOKIES_FILE`) are listed in `.env.example`.
-
-6. **Run.**
-
-   ```bash
-   source .venv/bin/activate
-   python bot.py
-   ```
-
-   The first start downloads the `distil-large-v3` Whisper model (about 1.5 GB) into
-   `~/.cache/huggingface/`. After that the bot logs `Bot is running` and you can send it links.
-
-## Using it
-
-Send the bot any YouTube video link (`youtube.com/watch?v=…`, `youtu.be/…`, Shorts, or
-`/live/` links of finished streams). It posts one status message and updates it in place as
-the job progresses:
+In Telegram the bot posts one status message per video and updates it in place:
 
 ```
 Processing
@@ -91,85 +26,159 @@ Screenshots — 2
 Writing note…
 ```
 
-The header turns into `Done` with a final line (`Note added to vault: …` when an upload
-command is configured, `Note saved: …` otherwise), or `Failed` with the reason. With
-`SEND_NOTE_FILE=true` the finished `.md` file is attached to the chat as well. A copy of
-every note is kept in the notes folder on the bot's machine.
+It ends as `Done` with `Note added to vault: …`, or `Failed` with the reason.
 
-The note has a summary, key takeaways, timestamped sections that follow the video's own
-structure (each heading and quote links to that moment on YouTube), things worth following
-up on, quotes, related-topic wikilinks, and, folded at the bottom, the full timestamped
-transcript so the whole video is searchable in Obsidian (`INCLUDE_TRANSCRIPT=false` turns
-that off).
+Everything is one Python file. It runs on a laptop or on a small always-on server (an AWS
+setup is included) and costs a few cents per video in API calls.
 
-**Screenshots.** Speech alone misses what is only on screen. After transcription, Claude reads
-the timestamped transcript once (the `CUE_PROMPT` constant in `bot.py`, run at low effort) and
-returns the moments where the screen carries information the speech doesn't: code, slides,
-charts, a website being walked through, and so on, each with a one-line reason. The bot
-grabs a frame at each of those moments from a small video-only stream (720p by default, about
-15 MB for a ten-minute video), drops near-duplicates, and sends up to 30 frames to the
-note-writing call labelled with their timestamps and reasons. Claude uses them to put the
-code, slide text, chart, or UI being discussed into the note, and to say explicitly when a
-screen reference could not be captured. Videos where nothing on screen matters download no
-video stream; the selection pass costs about a cent and each frame adds roughly 800 input
-tokens. `INCLUDE_FRAMES=false` turns it off; `CUE_MODEL`, `FRAMES_MAX`, and
-`FRAMES_VIDEO_HEIGHT` tune it. If the selection call or the video download fails, the note is
-still produced without screenshots.
+## Contents
 
-**Putting the file into Obsidian.** On the iPhone, tap the file in Telegram, tap the share
-icon, choose "Save to Files", and pick On My iPhone > Obsidian > your vault (or the vault's
-iCloud folder). Obsidian shows the note immediately. On a Mac, drag the file from Telegram
-into the vault folder in Finder.
+- [How it works](#how-it-works)
+- [Layout](#layout)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Deploy on AWS (EC2)](#deploy-on-aws-ec2)
+- [Faster transcription](#faster-transcription)
+- [Automatic sync into your vault](#automatic-sync-into-your-vault)
+- [Customising the notes](#customising-the-notes)
+- [Limitations and troubleshooting](#limitations-and-troubleshooting)
+- [License](#license)
 
-Errors (bad link, private or removed video, transcription failure, Anthropic API problems,
-unwritable notes folder) come back as a `❌` message with the reason.
+## How it works
 
-Notes are named after the video title (sanitized). An existing file is never overwritten;
-a duplicate title gets ` (2)`, ` (3)`, and so on.
+Each link goes through five steps, all in `bot.py`:
 
-## Run it as a service (optional)
+1. **Download.** yt-dlp fetches the audio-only stream and the video's metadata (title,
+   channel, chapters). Nothing is kept after the job.
+2. **Transcribe.** Either locally with faster-whisper (`distil-large-v3`, int8, English
+   only, no account needed) or through an OpenAI-compatible speech-to-text API (OpenAI or
+   Groq), which is about 100 times faster. Segments keep their timestamps.
+3. **Pick screenshots.** Speech alone misses what is only on screen. Claude reads the
+   timestamped transcript once (a cheap, low-effort call with a structured JSON reply) and
+   returns the moments where the screen carries information the words don't: code, slides,
+   charts, tables, a UI being walked through. Only then is a small video-only stream fetched;
+   a frame is grabbed at each moment, near-duplicates are dropped, and up to 30 frames go to
+   the next step labelled with their timestamps. A talk with nothing on screen gets no
+   screenshots and no video download.
+4. **Write the note.** Claude gets the transcript, the metadata, the chapters, and the frames,
+   plus a fixed template and a rule set, and writes the note. The rules that matter most,
+   all learned from testing across genres:
+   - Notes are organised by topic, not by time: each section is a concept, step, or argument,
+     bullets lead with the key point in bold, details nest under it.
+   - Timestamp links go on section headings, quotes, and on-screen references only.
+   - No fixed length; it follows how dense the content is.
+   - Sponsors, ads, and self-promotion are left out entirely, whether spoken or on screen.
+   - Speakers are attributed in interviews and inserted clips; stated numbers and named
+     examples are kept; on-screen references that could not be captured are flagged.
+   - Wikilinks only for entities you would want a note about, plus a Related section of
+     broader topics, so notes connect over time.
+5. **Deliver.** The note is written to a folder, optionally pushed anywhere by a shell command
+   (for example `aws s3 cp` into a bucket your vault syncs from), and optionally attached to
+   the chat as a file.
 
-Create `/etc/systemd/system/yt2obsidian.service` (adjust user and paths):
+Everything Claude-facing is a constant at the top of `bot.py`: `NOTE_TEMPLATE`,
+`SYSTEM_PROMPT`, `USER_PROMPT` (the note), and `CUE_PROMPT` (screenshot selection).
 
-```ini
-[Unit]
-Description=yt2obsidian Telegram bot
-Wants=network-online.target
-After=network-online.target
+## Layout
 
-[Service]
-User=you
-WorkingDirectory=/home/you/video_transcript
-ExecStart=/home/you/video_transcript/.venv/bin/python bot.py
-Restart=on-failure
-RestartSec=10
+| Path | What |
+|---|---|
+| `bot.py` | The whole bot: Telegram handlers, download, transcription (local or API), screenshot selection, note writing, delivery. |
+| `.env.example` | Every configuration variable with its default. |
+| `tests/` | Helper tests plus stub-driven tests of the Telegram and Claude layers; no network or API key needed. |
+| `eval/` | Cross-genre evaluation harness: eight real videos through the full pipeline, with cached transcripts and screenshots for fast prompt iteration. |
+| `deploy/` | First-boot script for an AWS EC2 instance, and an Obsidian-on-the-server installer for the Obsidian Sync route. |
+| `examples/` | A note generated by the pipeline. |
 
-[Install]
-WantedBy=multi-user.target
-```
+## Quick start
 
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now yt2obsidian
-journalctl -u yt2obsidian -f
-```
+You need Python 3.11+, `ffmpeg`, a Telegram bot token, and an Anthropic API key.
+
+1. **System packages** (Ubuntu shown; on macOS `brew install ffmpeg`):
+
+   ```bash
+   sudo apt update && sudo apt install -y ffmpeg python3 python3-venv python3-pip
+   ```
+
+2. **Python environment:**
+
+   ```bash
+   git clone https://github.com/mkhlndrv/yt2obsidian.git
+   cd yt2obsidian
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+   `yt-dlp[default,deno]` brings the JavaScript runtime yt-dlp needs for YouTube; it lands in
+   `.venv/bin/deno`, nothing system-wide.
+
+3. **Telegram bot token:** message [@BotFather](https://t.me/BotFather), send `/newbot`,
+   copy the token.
+
+4. **Anthropic API key:** create one at <https://console.anthropic.com/>.
+
+5. **Config:**
+
+   ```bash
+   cp .env.example .env
+   nano .env      # TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY; everything else has a default
+   ```
+
+6. **Run:**
+
+   ```bash
+   python bot.py
+   ```
+
+   The first start downloads the Whisper model (about 1.5 GB) into `~/.cache/huggingface/`.
+   When the log says `Bot is running`, send the bot `/start` (it replies with your Telegram
+   user id; put it into `TELEGRAM_ALLOWED_USER_IDS` so nobody else can use your bot), then a
+   YouTube link. Notes are saved under `notes/` next to `bot.py` and attached to the chat.
+
+To keep it running on any Linux box, a systemd unit like the one written by
+[`deploy/ec2-user-data.sh`](deploy/ec2-user-data.sh) works everywhere: `ExecStart` the venv's
+Python with `bot.py`, `Restart=always`, `WorkingDirectory` set to the repo.
+
+## Configuration
+
+All settings live in `.env` (see `.env.example`). Only the first two are required.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | | Token from BotFather. |
+| `ANTHROPIC_API_KEY` | | Anthropic API key. |
+| `TELEGRAM_ALLOWED_USER_IDS` | empty (anyone) | Comma-separated Telegram user ids allowed to use the bot. Send `/start` to learn yours. |
+| `OBSIDIAN_VAULT_PATH` | `notes/` next to `bot.py` | Folder where every note is written. Point it inside your vault if the bot runs on the machine that has the vault. |
+| `SEND_NOTE_FILE` | `true` | Attach the finished `.md` to the chat. Set `false` once the vault syncs by itself. |
+| `AFTER_NOTE_COMMAND` | empty | Shell command run after each note, `{path}` replaced by the file. Typically an upload, e.g. `aws s3 cp {path} s3://my-vault/YouTube/`. |
+| `CLAUDE_MODEL` | `claude-sonnet-5` | Model that writes the note. |
+| `TRANSCRIBER` | `local` | `local` (faster-whisper on this machine) or `api` (OpenAI-compatible endpoint). |
+| `STT_API_KEY`, `STT_BASE_URL`, `STT_MODEL` | OpenAI defaults | Transcription API settings; see [Faster transcription](#faster-transcription). |
+| `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE` | `distil-large-v3`, `cpu`, `int8` | Local model settings. `cuda` + `float16` on an NVIDIA GPU. |
+| `WHISPER_CPU_THREADS`, `WHISPER_BEAM_SIZE` | `0` (library default), `5` | Local speed knobs: threads = your core count; beam 1 is about 10% faster. |
+| `INCLUDE_FRAMES` | `true` | Screenshots on or off. |
+| `CUE_MODEL` | same as `CLAUDE_MODEL` | Model for the screenshot-selection pass. |
+| `FRAMES_MAX`, `FRAMES_VIDEO_HEIGHT` | `30`, `720` | Most screenshots per video; resolution of the video stream fetched for them. |
+| `INCLUDE_TRANSCRIPT` | `true` | Append the full timestamped transcript in a folded section. |
+| `MAX_VIDEO_MINUTES` | `0` (no limit) | Refuse longer videos. |
+| `YTDLP_COOKIES_FILE` | empty | Netscape-format cookies file for YouTube; needed on most cloud servers, see below. |
 
 ## Deploy on AWS (EC2)
 
-The bot is a single long-running process that polls Telegram, so it wants one small
-always-on Linux VM. It needs no inbound ports at all; all traffic is outbound.
+The bot is one long-running process that polls Telegram, so it wants one small always-on
+Linux VM with no inbound ports.
 
-1. **Launch an instance** in the EC2 console: Ubuntu Server 24.04 LTS, 2 vCPU and 4 GB RAM or
-   more (`t4g.medium` on ARM is the cheapest sensible choice and everything here ships ARM
-   wheels; `t3.medium` is the x86 equivalent; the 1 GB free-tier sizes cannot hold the model),
-   a 20 GB disk, a key pair you can SSH with, and a security group that allows SSH from your
-   IP only.
-2. **Paste the first-boot script** from [`deploy/ec2-user-data.sh`](deploy/ec2-user-data.sh)
-   into *Advanced details → User data* before launching. It installs ffmpeg and Python, clones
-   this repo into `/home/ubuntu/yt2obsidian`, installs the requirements, downloads the Whisper
-   model, and registers a systemd service. Give it about five minutes after boot;
-   `sudo tail -f /var/log/cloud-init-output.log` shows progress.
-3. **Configure and start.** SSH in as `ubuntu`, then:
+1. **Launch an instance** in the EC2 console: Ubuntu Server 24.04 LTS; `t4g.medium` (ARM, 2
+   vCPU, 4 GB, about $25 a month) or `t3.medium` on x86; a 20 GB disk; a key pair; a security
+   group that allows SSH from your IP only. With the API transcription backend a `t4g.small`
+   is enough. The 1 GB free-tier sizes cannot hold the Whisper model.
+2. **Paste [`deploy/ec2-user-data.sh`](deploy/ec2-user-data.sh)** into *Advanced details →
+   User data* before launching (edit `REPO_URL` first if you forked). On first boot it installs
+   ffmpeg and Python, clones the repo into `/home/ubuntu/yt2obsidian`, installs the
+   requirements, downloads the Whisper model, and registers a systemd service. About five
+   minutes; `sudo tail -f /var/log/cloud-init-output.log` shows progress.
+3. **Configure and start** over SSH as `ubuntu`:
 
    ```bash
    cd ~/yt2obsidian
@@ -179,19 +188,21 @@ always-on Linux VM. It needs no inbound ports at all; all traffic is outbound.
    journalctl -u yt2obsidian -f           # wait for "Bot is running"
    ```
 
-   The service restarts on failure and starts on boot. If you also run the bot elsewhere,
-   stop that copy first: Telegram lets only one process poll a bot token.
-
-4. **Pick the transcription speed you want.** With two vCPUs and local Whisper, expect
-   roughly realtime (a ten-minute video takes about ten minutes). For much faster notes, switch
-   to the API backend described in the next section; then a `t4g.small` is plenty.
+   The service restarts on failure and starts on boot. Telegram lets only one process poll a
+   bot token, so stop any other copy first.
+4. **YouTube cookies.** YouTube refuses downloads from most datacenter addresses
+   ("Sign in to confirm you're not a bot"). Fix: in your browser, install a cookies-export
+   extension ("Get cookies.txt LOCALLY" for Chrome, allowed in incognito), open a private
+   window, log in to YouTube, open `youtube.com/robots.txt` in a tab, export the cookies in
+   Netscape format, close the private window (so the browser never rotates those cookies).
+   Copy the file to the server, `chmod 600` it, and set `YTDLP_COOKIES_FILE` to its path. A
+   throwaway Google account works fine for this.
 
 **Updating:** `cd ~/yt2obsidian && git pull && sudo systemctl restart yt2obsidian`.
 
 ## Faster transcription
 
-Transcription is the slow step, and on a CPU it scales with cores. Measured on the same
-ten-minute video:
+Transcription is the slow step on a CPU. Measured on the same ten-minute video:
 
 | Setup | Time for 10 min of audio |
 | --- | --- |
@@ -199,149 +210,115 @@ ten-minute video:
 | Same, `WHISPER_BEAM_SIZE=1` | 118 s |
 | Same, faster-whisper batched pipeline | 6278 s (do not use on CPU) |
 | Local on a 2-vCPU cloud instance | roughly 600 s (about realtime) |
-| API backend (OpenAI `whisper-1` or Groq `whisper-large-v3-turbo`) | typically 15 to 60 s |
+| API backend (Groq `whisper-large-v3-turbo`, 19-minute video) | 7 s |
 
-The knobs that stay local (`WHISPER_BEAM_SIZE=1`, `WHISPER_CPU_THREADS=<cores>`, a bigger
-instance, or a GPU instance with `WHISPER_DEVICE=cuda`) give at most tens of percent per step
-or cost several times more per month. The API backend is the big win: set in `.env`
+Local knobs give tens of percent; the API backend is the real win and lets the server be
+tiny. Groq has a free tier; OpenAI charges about half a cent per minute. In `.env`:
 
 ```bash
 TRANSCRIBER=api
-STT_API_KEY=...                                  # OpenAI or Groq key
-STT_BASE_URL=https://api.openai.com/v1           # Groq: https://api.groq.com/openai/v1
-STT_MODEL=whisper-1                              # Groq: whisper-large-v3-turbo
+STT_API_KEY=...                                  # Groq or OpenAI key
+STT_BASE_URL=https://api.groq.com/openai/v1      # OpenAI: https://api.openai.com/v1
+STT_MODEL=whisper-large-v3-turbo                 # OpenAI: whisper-1
 ```
 
-and restart. The audio is re-encoded to small mono chunks (about 5 MB per 20 minutes), each
-chunk is uploaded, and the timestamps are stitched back together, so long videos work and the
-note format is unchanged. Cost is on the order of half a cent per minute of audio at OpenAI
-and a fraction of that at Groq, which also has a free tier. With this backend the server no
-longer needs the 1.5 GB model or a capable CPU. The local backend remains the default and
-needs no extra account.
-
-**Cost:** a `t4g.medium` runs in the region of $25 a month on-demand and a `t3.medium` about
-$30; the API calls add a few cents per video. Check the EC2 pricing page for your region.
+The audio is re-encoded to small mono chunks (about 5 MB per 20 minutes), each chunk is
+uploaded, and the timestamps are stitched back together, so long videos work and the note is
+unchanged. The local backend stays the default and needs no extra account.
 
 ## Automatic sync into your vault
 
-Saving the Telegram file by hand needs no setup. To have notes appear in the vault on their
-own, use one of the routes below and set `SEND_NOTE_FILE=false` so the bot just confirms
-each note instead of attaching it.
+Saving the attached file by hand needs no setup. For notes to appear in the vault on their
+own, use one of these routes and set `SEND_NOTE_FILE=false`.
 
-**Option A: Remotely Save plugin + an S3 bucket (free, recommended on AWS).** The
+**Option A: Remotely Save plugin + an S3 bucket (free, no Obsidian on the server).** The
 [Remotely Save](https://github.com/remotely-save/remotely-save) community plugin syncs an
-Obsidian vault with cloud storage and runs on iPhone, Mac, and desktop. The server side needs
-no Obsidian at all: the bot uploads each finished note to the bucket, and your devices pull it
-into the vault. S3 storage for a vault costs cents per month.
+Obsidian vault with cloud storage on iPhone, Android, Mac, and desktop. The bot uploads each
+note to the bucket; your devices pull it into the vault. Storage costs cents per month.
 
-1. **Bucket and keys.** In the AWS console create a private S3 bucket (say `my-vault`) and an
-   IAM user whose only permission is that bucket; download its access key. On the server,
-   the simplest is an instance role with access to the bucket, otherwise `aws configure` with
-   the same key.
-2. **Server.** `sudo apt install -y awscli`, then in `.env`:
+1. **AWS console.** Create a private S3 bucket (say `my-vault`). Create an IAM policy that
+   allows `s3:ListBucket` on the bucket and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`
+   on `bucket/*`, attach it to a new IAM user, and create an access key for that user.
+2. **Server.** Install the AWS CLI (Ubuntu 24.04 has no `awscli` package; use
+   [Amazon's installer](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)),
+   run `aws configure` with the key and the bucket's region, then in `.env`:
 
    ```bash
    AFTER_NOTE_COMMAND=aws s3 cp {path} s3://my-vault/YouTube/
    SEND_NOTE_FILE=false
    ```
 
-   and restart the bot. Every note now lands in `YouTube/` in the bucket. A failed upload
-   comes back as a Telegram warning; the note is still saved on the server.
-3. **Devices.** In Obsidian on the phone and the Mac install Remotely Save, choose S3, enter
-   the endpoint `https://s3.<region>.amazonaws.com`, the region, the access key, the secret,
-   and the bucket name, then run a sync and turn on auto-sync in its settings. New notes
-   appear under `YouTube/` in the vault.
+   Restart the bot. A failed upload is reported in the status message; the note stays on
+   the server.
+3. **Devices.** In Obsidian, install Remotely Save, choose S3, enter the endpoint
+   `https://s3.<region>.amazonaws.com`, the region, the access key and secret, and the bucket
+   name; run a sync; turn on auto sync. Notes appear under `YouTube/`.
 
 Remotely Save also speaks Dropbox, OneDrive, Google Drive, and WebDAV; with
-[rclone](https://rclone.org/) on the server, the same one-liner works for those:
+[rclone](https://rclone.org/) on the server the same one-liner works for those, e.g.
 `AFTER_NOTE_COMMAND=rclone copy {path} dropbox:Vault/YouTube`.
 
-**Option B: [Syncthing](https://syncthing.net/), free and peer-to-peer.** Syncs the vault
-folder directly between devices; the iOS client, Möbius Sync, is a one-time paid app:
+**Option B: [Syncthing](https://syncthing.net/), free and peer-to-peer.** Run Syncthing on
+the server (`sudo apt install syncthing`, `sudo systemctl enable --now syncthing@$USER`, web UI
+on `localhost:8384` through an SSH tunnel), share the vault folder, and set
+`OBSIDIAN_VAULT_PATH` to a subfolder of it. Desktop clients are free; on iOS use Möbius Sync
+(a one-time paid app) and point it at the Obsidian vault folder through the Files picker.
+Notes reach the phone whenever Möbius Sync runs.
 
-1. **Server.** Install and start Syncthing for your user:
-
-   ```bash
-   sudo apt install -y syncthing
-   sudo systemctl enable --now syncthing@$USER
-   ```
-
-   Open its web UI from your laptop through an SSH tunnel:
-
-   ```bash
-   ssh -L 8384:localhost:8384 you@server   # then browse to http://localhost:8384
-   ```
-
-   Add a folder for the vault root, for example `/home/you/vault`, and set
-   `OBSIDIAN_VAULT_PATH=/home/you/vault/YouTube` in `.env`. Note the server's Device ID
-   (Actions -> Show ID).
-
-2. **iPhone.** In Obsidian, create a new vault stored on the phone (leave "Store in iCloud"
-   off). Install Möbius Sync from the App Store. In Möbius Sync add the server as a device
-   (scan the QR code from the server's web UI), accept the device on the server side, then
-   accept the shared vault folder on the phone. When Möbius asks where to put it, pick the
-   Obsidian vault folder through the Files picker (On My iPhone -> Obsidian -> your vault).
-
-3. **Mac (optional).** `brew install syncthing`, share the same folder, and open it with
-   Obsidian on the desktop for editing.
-
-Syncthing creates a small `.stfolder` marker inside the vault; Obsidian ignores it. New notes
-appear on the phone when Möbius Sync runs, which is whenever the app is open plus the short
-background windows iOS grants it.
-
-**Option C: Obsidian Sync (paid subscription).** Obsidian Sync only works inside the Obsidian
-app, so this route runs the desktop app on the server on a virtual display, signed in, with
-the vault open; it then pushes notes to your devices natively, background sync included.
+**Option C: Obsidian Sync (paid).** Obsidian Sync only works inside the Obsidian app, so run
+the desktop app on the server on a virtual display, signed in, with the vault open:
 `sudo bash deploy/obsidian-server.sh` installs Obsidian (x86 `.deb` or ARM AppImage), the
-virtual display, and two systemd services, and prints the one-time VNC sign-in steps. Needs
-about 500 MB of extra RAM on the server. Afterwards set
-`OBSIDIAN_VAULT_PATH=/home/ubuntu/vault/YouTube` and check once that the sign-in survives
-`sudo systemctl restart obsidian`.
+display, and two systemd services, and prints the one-time VNC sign-in steps. Needs about
+500 MB extra RAM. Then set `OBSIDIAN_VAULT_PATH=/home/ubuntu/vault/YouTube`.
 
-## Development
+## Customising the notes
 
-Tests need no network or API key; they exercise the helpers and drive the Telegram and
-Claude layers with stubs:
+- **Template and prompts** are the constants at the top of `bot.py`. In `NOTE_TEMPLATE` the
+  bot fills `{title}`, `{url}`, `{channel}`, `{published}`, `{date}`, and `{duration}` from
+  real metadata; every other `{placeholder}` is written by Claude, and `{timestamp link}`
+  becomes a link to that moment. `SYSTEM_PROMPT` holds the rules, `CUE_PROMPT` decides which
+  moments get a screenshot.
+- **Check a change across genres** before trusting it. `eval/eval_batch.py` runs eight real
+  videos (tech, crypto, economics, interview, science, finance, business, health) through the
+  full pipeline into `eval/vault/` with metrics in `eval/results.json`. Transcripts and
+  screenshots are cached under `eval/cache/`, so after the first full run a prompt tweak
+  re-checks every genre with only the Claude calls, about four minutes:
 
-```bash
-.venv/bin/python tests/test_helpers.py
-.venv/bin/python tests/test_stubs.py
-```
+  ```bash
+  .venv/bin/python eval/eval_batch.py                       # full run (uses cache when present)
+  .venv/bin/python eval/eval_batch.py --notes-only          # only regenerate the notes
+  .venv/bin/python eval/eval_batch.py --notes-only crypto   # one genre
+  ```
 
-`eval/eval_batch.py` runs eight real videos of different genres (tech, crypto, economics,
-interview, science, finance, business, health) through the full pipeline and writes the notes
-to `eval/vault/` with metrics in `eval/results.json`. Transcripts and screenshots are cached
-under `eval/cache/`, so after the first full run a prompt change can be re-checked across all
-genres with only the Claude calls:
+- **Tests** need no network or API key and run in CI on every push:
 
-```bash
-.venv/bin/python eval/eval_batch.py                       # full run (uses cache when present)
-.venv/bin/python eval/eval_batch.py --notes-only          # only regenerate the notes
-.venv/bin/python eval/eval_batch.py --notes-only crypto   # one genre
-```
+  ```bash
+  .venv/bin/python tests/test_helpers.py
+  .venv/bin/python tests/test_stubs.py
+  ```
 
-## Notes and troubleshooting
+## Limitations and troubleshooting
 
-- **Speed.** Local transcription runs on the CPU with `int8` weights: about 4.5x realtime on
-  a 12-core laptop, about realtime on a 2-vCPU cloud instance, and several times slower on a
-  busy machine. See "Faster transcription" above for the API backend. Jobs are transcribed one
-  at a time; the bot stays responsive and tells you when a job is queued.
-- **`Sign in to confirm you're not a bot` / HTTP 403 from YouTube.** Export your browser
-  cookies to a Netscape-format `cookies.txt` (for example with the "Get cookies.txt LOCALLY"
-  browser extension) and set `YTDLP_COOKIES_FILE` to its path.
-- **Downloads suddenly failing.** YouTube changes often; update yt-dlp:
-  `pip install -U "yt-dlp[default,deno]"`.
-- **`No supported JavaScript runtime could be found` in the log.** The `deno` extra did not
-  install. Either re-run the pip command above or install deno system-wide
-  (`curl -fsSL https://deno.land/install.sh | sh`) and make sure it is on the bot's `PATH`.
-- **GPU.** With an NVIDIA GPU and CUDA libraries installed, set `WHISPER_DEVICE=cuda` and
-  `WHISPER_COMPUTE_TYPE=float16` in `.env`.
-- **Other languages.** `distil-large-v3` is English-only. For other languages set
-  `WHISPER_MODEL=large-v3` (slower) and remove `language="en"` in `transcribe_audio` so
-  Whisper auto-detects the language.
-- **Changing the note format.** Edit `NOTE_TEMPLATE` in `bot.py`. The bot fills
-  `{title}`, `{url}`, `{channel}`, `{published}`, `{date}`, and `{duration}` from real video
-  metadata; every other `{placeholder}` is written by Claude, and `{timestamp link}` becomes
-  a link to that moment in the video. Prompt wording lives in `SYSTEM_PROMPT` and
-  `USER_PROMPT` right below it. There is deliberately no target word count: the prompt asks
-  for length to follow how dense the content is.
+- **English only** with the default local model. For other languages set
+  `WHISPER_MODEL=large-v3` (slower) and remove `language="en"` in `transcribe_audio_local`,
+  or use the API backend, which handles any language.
+- **Screenshots are chosen from the transcript.** A slide deck whose presenter never refers
+  to the slides gets no screenshots. That is the trade-off of not sampling frames on a timer,
+  which wasted tokens on illustrations.
+- **Model variance.** Occasionally a note drops a fence or keeps a mis-heard name; the
+  structural slips are repaired in code, the rare content-level ones are not.
+- **`Sign in to confirm you're not a bot`** from YouTube: see the cookies step under Deploy.
+  If it reappears months later, the cookies expired; export again.
+- **Downloads suddenly failing:** YouTube changes often; `pip install -U "yt-dlp[default,deno]"`.
+- **`No supported JavaScript runtime`** in the log: the `deno` extra did not install; re-run
+  the pip command above.
+- **Costs** per ten-minute video on the defaults: about 6k input tokens for a talk-only video
+  and up to 25k with many screenshots, plus 2 to 4k output, so a few cents on Sonnet; the
+  screenshot-selection pass is about a cent; Groq transcription is free-tier or fractions of a
+  cent.
+- **Secrets.** `.env`, cookies files, and `.pem` keys are gitignored. Keep `.env` at mode 600
+  on a server and lock the bot to your user id.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

@@ -7,12 +7,15 @@
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
+# Point this at your fork if you have one.
+REPO_URL="https://github.com/mkhlndrv/yt2obsidian.git"
+
 apt-get update
 apt-get install -y ffmpeg python3 python3-venv git
 
-sudo -u ubuntu -H bash -euxo pipefail <<'EOF'
+sudo -u ubuntu -H env REPO_URL="$REPO_URL" bash -euxo pipefail <<'EOF'
 cd ~
-git clone https://github.com/mkhlndrv/yt2obsidian.git
+git clone "$REPO_URL" yt2obsidian
 cd yt2obsidian
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
