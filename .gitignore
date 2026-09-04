@@ -1,0 +1,19 @@
+# secrets and local config
+.env
+.claude/
+.remember/
+
+# environments and caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+
+# generated notes and evaluation data
+notes/
+test_vault/
+eval/cache/
+eval/vault/
+eval/results.json

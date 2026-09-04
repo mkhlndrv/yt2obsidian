@@ -1,0 +1,10 @@
+python-telegram-bot>=22.0
+# [default] adds the YouTube JS-challenge solver, [deno] bundles the JavaScript runtime it needs
+yt-dlp[default,deno]>=2026.1.1
+faster-whisper>=1.1.0
+# numpy and av come with faster-whisper; listed because bot.py imports them directly (screenshots)
+numpy
+av
+anthropic>=1.0.0
+pydantic>=2.0
+python-dotenv>=1.0.0

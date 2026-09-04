@@ -1,0 +1,231 @@
+"""Exercise generate_note() and the Telegram handlers with stubbed Anthropic / Telegram objects."""
+import os, sys, asyncio, types
+os.environ.update(TELEGRAM_BOT_TOKEN="x", ANTHROPIC_API_KEY="x", OBSIDIAN_VAULT_PATH=__import__("tempfile").mkdtemp(prefix="yt2obsidian-test-"))
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+import anthropic, httpx2 as httpx
+import bot
+
+meta = bot.VideoMeta(video_id="dQw4w9WgXcQ", url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                     title="A Talk", channel="Chan", published="2024-01-02", duration_seconds=65, description="")
+
+class FakeStream:
+    def __init__(self, msg): self.msg = msg
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+    async def get_final_message(self): return self.msg
+
+def fake_client(msg=None, exc=None, parsed=None):
+    captured = {}
+    def stream(**kw):
+        captured.update(kw)
+        if exc: raise exc
+        return FakeStream(msg)
+    async def parse(**kw):
+        captured.update(kw)
+        if exc: raise exc
+        return types.SimpleNamespace(parsed_output=parsed)
+    return types.SimpleNamespace(messages=types.SimpleNamespace(stream=stream, parse=parse)), captured
+
+def fake_message(text, stop_reason="end_turn"):
+    blocks = [types.SimpleNamespace(type="thinking", thinking=""), types.SimpleNamespace(type="text", text=text)]
+    return types.SimpleNamespace(stop_reason=stop_reason, content=blocks,
+                                 usage=types.SimpleNamespace(input_tokens=10, output_tokens=5))
+
+async def main():
+    # happy path
+    note_text = "---\ntitle: \"A Talk\"\ntags:\n  - youtube\n  - talks\n---\n\n# A Talk\n\n## Key Points\n- x"
+    client, captured = fake_client(fake_message(note_text))
+    bot._anthropic_client = client
+    note = await bot.generate_note(meta, "hello world transcript")
+    assert note == note_text + "\n", repr(note)
+    assert captured["model"] == "claude-sonnet-5" and captured["thinking"] == {"type": "adaptive"}
+    assert captured["system"] == bot.SYSTEM_PROMPT
+    content = captured["messages"][0]["content"]
+    assert isinstance(content, list) and len(content) == 1 and content[0]["type"] == "text", content
+    assert "hello world transcript" in content[0]["text"] and 'title: "A Talk"' in content[0]["text"]
+    print("generate_note happy path OK")
+
+    # with screenshots: intro text, then label + image per frame, then the prompt
+    import base64
+    bot._anthropic_client, captured = fake_client(fake_message(note_text))
+    await bot.generate_note(meta, "t", frames=[(12.0, "the code", b"\xff\xd8jpeg-bytes")])
+    content = captured["messages"][0]["content"]
+    assert [c["type"] for c in content] == ["text", "text", "image", "text"], content
+    assert content[0]["text"] == bot.FRAMES_INTRO
+    assert content[1]["text"] == "Frame at [0:12](https://youtu.be/dQw4w9WgXcQ?t=12) (the code):"
+    assert content[2]["source"] == {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(b"\xff\xd8jpeg-bytes").decode()}
+    assert "TRANSCRIPT" in content[3]["text"]
+    print("generate_note with frames OK")
+
+    # find_screen_cues: structured call, normalized result, failure -> no screenshots
+    picked = bot.ScreenMoments(moments=[bot.ScreenMoment(seconds=40, why="terminal output"),
+                                        bot.ScreenMoment(seconds=12.4, why="the code"),
+                                        bot.ScreenMoment(seconds=13, why="same screen"),
+                                        bot.ScreenMoment(seconds=5000, why="hallucinated")])
+    bot._anthropic_client, captured = fake_client(parsed=picked)
+    cues = await bot.find_screen_cues([(0.0, 1.0, "hello"), (12.0, 15.0, "this code here")], meta)
+    assert cues == [(12.4, "the code"), (40.0, "terminal output")], cues
+    assert captured["output_format"] is bot.ScreenMoments and captured["model"] == bot.CUE_MODEL
+    assert captured["output_config"] == {"effort": "low"} and "12: this code here" in captured["messages"][0]["content"]
+    assert captured["system"] == bot.CUE_PROMPT.format(max_moments=bot.FRAMES_MAX)
+    cue_req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    bot._anthropic_client, _ = fake_client(exc=anthropic.APIConnectionError(request=cue_req))
+    assert await bot.find_screen_cues([(0.0, 1.0, "hello")], meta) == []
+    bot._anthropic_client, _ = fake_client(parsed=None)
+    assert await bot.find_screen_cues([(0.0, 1.0, "hello")], meta) == []
+    print("find_screen_cues OK")
+
+    # truncated
+    bot._anthropic_client, _ = fake_client(fake_message(note_text, stop_reason="max_tokens"))
+    note = await bot.generate_note(meta, "t")
+    assert "Note truncated" in note
+    print("generate_note max_tokens OK")
+
+    # refusal / empty
+    for msg, expect in [(fake_message(note_text, "refusal"), "declined"), (fake_message("   "), "empty")]:
+        bot._anthropic_client, _ = fake_client(msg)
+        try:
+            await bot.generate_note(meta, "t"); raise AssertionError("no error")
+        except bot.PipelineError as e:
+            assert expect in str(e), e
+    print("generate_note refusal/empty OK")
+
+    # API errors -> PipelineError with clear text
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    def status_exc(cls, code):
+        return cls("boom", response=httpx.Response(code, request=req), body=None)
+    errs = [
+        (status_exc(anthropic.AuthenticationError, 401), "API key"),
+        (status_exc(anthropic.NotFoundError, 404), "not found"),
+        (status_exc(anthropic.RateLimitError, 429), "rate limit"),
+        (status_exc(anthropic.InternalServerError, 500), "API error 500"),
+        (anthropic.APIConnectionError(request=req), "Could not reach"),
+    ]
+    for exc, expect in errs:
+        bot._anthropic_client, _ = fake_client(exc=exc)
+        try:
+            await bot.generate_note(meta, "t"); raise AssertionError("no error")
+        except bot.PipelineError as e:
+            assert expect in str(e), (type(exc).__name__, str(e))
+    print("generate_note error mapping OK")
+
+    # --- Telegram handlers with a fake update/context ------------------------
+    replies, sent, tasks, docs = [], [], [], []
+    async def reply_text(t): replies.append(t)
+    async def send_message(chat_id, text): sent.append((chat_id, text))
+    async def send_document(chat_id, document, filename, caption): docs.append((chat_id, document, filename, caption))
+    def create_task(coro, update=None): tasks.append(coro)
+    def mk_update(text, uid=42):
+        msg = types.SimpleNamespace(text=text, chat_id=7, reply_text=reply_text)
+        return types.SimpleNamespace(effective_message=msg, effective_user=types.SimpleNamespace(id=uid))
+    ctx = types.SimpleNamespace(bot=types.SimpleNamespace(send_message=send_message, send_document=send_document),
+                                application=types.SimpleNamespace(create_task=create_task))
+
+    await bot.handle_message(mk_update("hi there"), ctx)
+    assert "doesn't look like a YouTube link" in replies[-1] and not tasks
+    await bot.handle_message(mk_update("https://youtu.be/dQw4w9WgXcQ"), ctx)
+    assert "Processing started" in replies[-1] and len(tasks) == 1
+    tasks[-1].close()
+    print("handle_message routing OK")
+
+    bot.ALLOWED_USER_IDS.add(1)
+    await bot.handle_message(mk_update("https://youtu.be/dQw4w9WgXcQ", uid=42), ctx)
+    assert "private" in replies[-1] and len(tasks) == 1
+    bot.ALLOWED_USER_IDS.clear()
+    print("authorization OK")
+
+    await bot.cmd_start(mk_update("/start"), ctx)
+    assert "user id is 42" in replies[-1]
+    print("cmd_start OK")
+
+    from telegram.error import NetworkError as NE, TimedOut
+    n = len(replies)
+    await bot.on_error(None, types.SimpleNamespace(error=NE("dns down")))      # polling error, no update
+    await bot.on_error(None, types.SimpleNamespace(error=TimedOut()))          # subclass of NetworkError
+    assert len(replies) == n
+    await bot.on_error(mk_update("x"), types.SimpleNamespace(error=RuntimeError("bad")))
+    assert replies[-1] == "❌ Unexpected error (RuntimeError): bad", replies[-1]
+    print("on_error OK")
+
+    # process_video: download failure surfaces as a clear message, nothing else runs
+    def boom(*a, **k): raise bot.PipelineError("Could not download the video: Video unavailable")
+    bot.download_audio = boom
+    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    assert sent[-1] == (7, "❌ Could not download the video: Video unavailable"), sent
+    def crash(*a, **k): raise RuntimeError("weird")
+    bot.download_audio = crash
+    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    assert sent[-1][1].startswith("❌ Unexpected error (RuntimeError): weird"), sent
+    print("process_video error reporting OK")
+
+    # process_video full flow with stubbed steps -> file written, stage messages sent
+    import pathlib, shutil, tempfile
+    v = pathlib.Path(os.environ["OBSIDIAN_VAULT_PATH"]); shutil.rmtree(v, ignore_errors=True); v.mkdir()
+    def fake_download(vid, out_dir):
+        p = out_dir / "audio.m4a"; p.write_bytes(b"x"); return meta, p
+    seen = {}
+    def fake_transcribe(p, video_id): seen["audio_existed"] = p.exists(); seen["path"] = p; seen["vid"] = video_id; return [(0.0, 1.0, "one two three")]
+    bot.download_audio = fake_download; bot.transcribe_audio = fake_transcribe
+    bot.INCLUDE_TRANSCRIPT = False
+    bot.INCLUDE_FRAMES = False
+    bot._anthropic_client, _ = fake_client(fake_message(note_text))
+    n_before = len(sent)
+    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    msgs = [t for _, t in sent[n_before:]]
+    assert len(msgs) == 2 and msgs[0].startswith("Downloaded “A Talk” (1:05)") and msgs[1].startswith("Transcribed 3 words"), msgs
+    assert (v / "A Talk.md").read_text() == note_text + "\n"
+    assert docs == [(7, (note_text + "\n").encode(), "A Talk.md", "✅ A Talk\nSave this file into your Obsidian vault.")], docs
+    assert seen["audio_existed"] and not seen["path"].exists(), "temp audio not deleted"
+    assert seen["vid"] == "dQw4w9WgXcQ"
+    print("process_video full flow OK (temp audio deleted, note written, file sent)")
+
+    # with INCLUDE_TRANSCRIPT the saved note and the sent file carry the folded transcript
+    bot.INCLUDE_TRANSCRIPT = True
+    bot._anthropic_client, _ = fake_client(fake_message(note_text))
+    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    saved = (v / "A Talk (2).md").read_text()
+    assert saved.endswith("## Transcript\n> [!quote]- Full transcript (speech recognition, may contain errors)\n> [0:00](https://youtu.be/dQw4w9WgXcQ?t=0) one two three\n"), saved
+    assert docs[-1][1] == saved.encode()
+    bot.INCLUDE_TRANSCRIPT = False
+    print("transcript appended OK")
+
+    # screenshots enabled but Claude picks no moment: no video download, no frames
+    bot.INCLUDE_FRAMES = True
+    calls = []
+    def fake_video(vid, out_dir): calls.append("video"); p = out_dir / "video.mp4"; p.write_bytes(b"v"); return p
+    def fake_frames(vp, m, out_dir, cues): assert vp.exists(); calls.append(("frames", cues)); return [(5.0, "why", b"img")]
+    async def no_cues(segments, m): return []
+    bot.download_video_stream = fake_video; bot.extract_frames = fake_frames; bot.find_screen_cues = no_cues
+    bot._anthropic_client, captured = fake_client(fake_message(note_text))
+    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    assert calls == [] and sent[-1][1].startswith("Transcribed 3 words. Asking Claude"), (calls, sent[-1])
+    # with a picked moment: video stream + frame at that moment, Claude receives the image, message counts it
+    async def one_cue(segments, m): return [(12.0, "the code")]
+    bot.find_screen_cues = one_cue
+    bot._anthropic_client, captured = fake_client(fake_message(note_text))
+    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    assert calls == ["video", ("frames", [(12.0, "the code")])], calls
+    assert sent[-1][1].startswith("Transcribed 3 words and 1 screenshot."), sent[-1]
+    assert any(c["type"] == "image" for c in captured["messages"][0]["content"])
+    # frame extraction failure must not lose the note
+    def broken_frames(vp, m, out_dir, cues): raise RuntimeError("ffmpeg missing")
+    bot.extract_frames = broken_frames
+    bot._anthropic_client, captured = fake_client(fake_message(note_text))
+    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    assert sent[-1][1].startswith("Transcribed 3 words. Asking Claude"), sent[-1]
+    assert (v / "A Talk (5).md").exists()
+    bot.INCLUDE_FRAMES = False
+    print("frames flow OK (Claude-gated, image sent, extraction failure tolerated)")
+
+    # send_document failure -> note kept, clear warning
+    from telegram.error import NetworkError
+    async def bad_send_document(**kw): raise NetworkError("boom")
+    ctx.bot.send_document = bad_send_document
+    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    assert sent[-1][1].startswith("⚠️ The note was saved at") and "boom" in sent[-1][1], sent[-1]
+    assert (v / "A Talk (6).md").exists()
+    shutil.rmtree(v)
+    print("send_document failure path OK")
+    print("ALL STUB TESTS PASSED")
+
+asyncio.run(main())
