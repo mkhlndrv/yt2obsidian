@@ -172,11 +172,42 @@ always-on Linux VM. It needs no inbound ports at all; all traffic is outbound.
    The service restarts on failure and starts on boot. If you also run the bot elsewhere,
    stop that copy first: Telegram lets only one process poll a bot token.
 
-4. **Tune for the instance.** With two vCPUs, expect transcription at roughly realtime (a
-   ten-minute video takes about ten minutes). Setting `WHISPER_CPU_THREADS=2` and
-   `WHISPER_BEAM_SIZE=1` in `.env` speeds it up; a bigger instance speeds it up more.
+4. **Pick the transcription speed you want.** With two vCPUs and local Whisper, expect
+   roughly realtime (a ten-minute video takes about ten minutes). For much faster notes, switch
+   to the API backend described in the next section; then a `t4g.small` is plenty.
 
 **Updating:** `cd ~/yt2obsidian && git pull && sudo systemctl restart yt2obsidian`.
+
+## Faster transcription
+
+Transcription is the slow step, and on a CPU it scales with cores. Measured on the same
+ten-minute video:
+
+| Setup | Time for 10 min of audio |
+| --- | --- |
+| Local `distil-large-v3`, 12-core laptop, defaults | 129 s |
+| Same, `WHISPER_BEAM_SIZE=1` | 118 s |
+| Same, faster-whisper batched pipeline | 6278 s (do not use on CPU) |
+| Local on a 2-vCPU cloud instance | roughly 600 s (about realtime) |
+| API backend (OpenAI `whisper-1` or Groq `whisper-large-v3-turbo`) | typically 15 to 60 s |
+
+The knobs that stay local (`WHISPER_BEAM_SIZE=1`, `WHISPER_CPU_THREADS=<cores>`, a bigger
+instance, or a GPU instance with `WHISPER_DEVICE=cuda`) give at most tens of percent per step
+or cost several times more per month. The API backend is the big win: set in `.env`
+
+```bash
+TRANSCRIBER=api
+STT_API_KEY=...                                  # OpenAI or Groq key
+STT_BASE_URL=https://api.openai.com/v1           # Groq: https://api.groq.com/openai/v1
+STT_MODEL=whisper-1                              # Groq: whisper-large-v3-turbo
+```
+
+and restart. The audio is re-encoded to small mono chunks (about 5 MB per 20 minutes), each
+chunk is uploaded, and the timestamps are stitched back together, so long videos work and the
+note format is unchanged. Cost is on the order of half a cent per minute of audio at OpenAI
+and a fraction of that at Groq, which also has a free tier. With this backend the server no
+longer needs the 1.5 GB model or a capable CPU. The local backend remains the default and
+needs no extra account.
 
 **Cost:** a `t4g.medium` runs in the region of $25 a month on-demand and a `t3.medium` about
 $30; the API calls add a few cents per video. Check the EC2 pricing page for your region.
@@ -243,11 +274,10 @@ genres with only the Claude calls:
 
 ## Notes and troubleshooting
 
-- **Speed.** Transcription runs on the CPU with `int8` weights. On the 12-core Mac used for
-  development it ran at about 4.5x realtime with the defaults (a 10-minute video in a bit
-  over 2 minutes) and about 6x with `WHISPER_CPU_THREADS` set to the core count and
-  `WHISPER_BEAM_SIZE=1`. A busy machine can be several times slower. Jobs are transcribed
-  one at a time; the bot stays responsive and tells you when a job is queued.
+- **Speed.** Local transcription runs on the CPU with `int8` weights: about 4.5x realtime on
+  a 12-core laptop, about realtime on a 2-vCPU cloud instance, and several times slower on a
+  busy machine. See "Faster transcription" above for the API backend. Jobs are transcribed one
+  at a time; the bot stays responsive and tells you when a job is queued.
 - **`Sign in to confirm you're not a bot` / HTTP 403 from YouTube.** Export your browser
   cookies to a Netscape-format `cookies.txt` (for example with the "Get cookies.txt LOCALLY"
   browser extension) and set `YTDLP_COOKIES_FILE` to its path.

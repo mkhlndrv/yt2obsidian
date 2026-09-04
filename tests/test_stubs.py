@@ -75,6 +75,32 @@ async def main():
     assert await bot.find_screen_cues([(0.0, 1.0, "hello")], meta) == []
     print("find_screen_cues OK")
 
+    # transcribe_audio via the API backend: chunks are stitched with time offsets; failures are clear
+    import httpx as _httpx
+    from pathlib import Path as _P
+    bot.TRANSCRIBER = "api"
+    bot._split_audio_for_api = lambda audio, out: [_P("chunk_000.mp3"), _P("chunk_001.mp3")]
+    payloads = {
+        "chunk_000.mp3": {"duration": 1200.0, "segments": [{"start": 0.0, "end": 4.0, "text": " Hello "}, {"start": 4.0, "end": 9.0, "text": "world"}]},
+        "chunk_001.mp3": {"duration": 30.0, "text": "plain text only"},
+    }
+    bot._post_transcription = lambda chunk: payloads[chunk.name]
+    segs = bot.transcribe_audio(_P("audio.m4a"), "dQw4w9WgXcQ")
+    assert segs == [(0.0, 4.0, "Hello"), (4.0, 9.0, "world"), (1200.0, 1230.0, "plain text only")], segs
+    def boom_post(chunk): raise _httpx.ConnectError("no route")
+    bot._post_transcription = boom_post
+    try:
+        bot.transcribe_audio(_P("audio.m4a"), "x"); raise AssertionError("no error")
+    except bot.PipelineError as e:
+        assert "Could not reach the transcription API" in str(e), e
+    bot._post_transcription = lambda chunk: {"duration": 5.0, "segments": []}
+    try:
+        bot.transcribe_audio(_P("audio.m4a"), "x"); raise AssertionError("no error")
+    except bot.PipelineError as e:
+        assert "no text" in str(e), e
+    bot.TRANSCRIBER = "local"
+    print("transcribe_audio api backend OK")
+
     # truncated
     bot._anthropic_client, _ = fake_client(fake_message(note_text, stop_reason="max_tokens"))
     note = await bot.generate_note(meta, "t")

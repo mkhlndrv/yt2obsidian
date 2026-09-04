@@ -1,4 +1,6 @@
 python-telegram-bot>=22.0
+# httpx comes with python-telegram-bot; listed because bot.py imports it directly (transcription API)
+httpx
 # [default] adds the YouTube JS-challenge solver, [deno] bundles the JavaScript runtime it needs
 yt-dlp[default,deno]>=2026.1.1
 faster-whisper>=1.1.0

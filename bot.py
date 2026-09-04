@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 
 import anthropic
 import av  # bundled with faster-whisper; used to read frame thumbnails
+import httpx  # bundled with python-telegram-bot; used for the optional transcription API
 import numpy as np
 import yt_dlp
 from dotenv import load_dotenv
@@ -259,6 +260,15 @@ WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
 WHISPER_CPU_THREADS = int(os.environ.get("WHISPER_CPU_THREADS", "0") or 0)  # 0 = library default
 WHISPER_BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", "5") or 5)  # 1 = faster, a bit less accurate
+
+# Transcription backend. "local" runs faster-whisper on this machine. "api" uploads the audio to an
+# OpenAI-compatible speech-to-text endpoint (OpenAI whisper-1, or Groq whisper-large-v3-turbo), which
+# transcribes a 10-minute video in well under a minute and lets the bot run on a tiny server.
+TRANSCRIBER = os.environ.get("TRANSCRIBER", "local").strip().lower()
+STT_API_KEY = os.environ.get("STT_API_KEY", "").strip()
+STT_BASE_URL = os.environ.get("STT_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+STT_MODEL = os.environ.get("STT_MODEL", "whisper-1").strip()
+STT_CHUNK_MINUTES = 20  # uploads are capped at 25 MB; 20 min of 32 kbps mono mp3 is about 5 MB
 
 def _env_flag(name: str, default: str = "true") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
@@ -704,11 +714,11 @@ def transcript_word_count(transcript: str) -> int:
     return len(_TIMESTAMP_LINK_RE.sub("", transcript).split())
 
 
-def transcribe_audio(audio_path: Path, video_id: str) -> list[Segment]:
-    """Blocking. Returns the English transcript as (start, end, text) segments."""
+def transcribe_audio_local(audio_path: Path) -> list[Segment]:
+    """Blocking. faster-whisper on this machine."""
     model = get_whisper_model()
     try:
-        raw_segments, info = model.transcribe(
+        raw_segments, _info = model.transcribe(
             str(audio_path),
             language="en",  # distil-large-v3 is English-only
             beam_size=WHISPER_BEAM_SIZE,
@@ -716,14 +726,73 @@ def transcribe_audio(audio_path: Path, video_id: str) -> list[Segment]:
             condition_on_previous_text=False,  # avoids repetition loops on long audio
         )
         # `raw_segments` is a lazy generator: transcription happens as it is consumed.
-        segments = [(seg.start, seg.end, seg.text.strip()) for seg in raw_segments if seg.text.strip()]
+        return [(seg.start, seg.end, seg.text.strip()) for seg in raw_segments if seg.text.strip()]
     except Exception as exc:
         raise PipelineError(f"Transcription failed ({exc.__class__.__name__}): {exc}") from exc
 
+
+def _split_audio_for_api(audio_path: Path, out_dir: Path) -> list[Path]:
+    """Re-encode the audio into small mono mp3 chunks that fit the API upload limit."""
+    out_dir.mkdir(exist_ok=True)
+    result = subprocess.run(
+        [
+            "ffmpeg", "-loglevel", "error", "-y", "-i", str(audio_path), "-vn", "-ac", "1", "-ar", "16000",
+            "-b:a", "32k", "-f", "segment", "-segment_time", str(STT_CHUNK_MINUTES * 60),
+            "-reset_timestamps", "1", str(out_dir / "chunk_%03d.mp3"),
+        ],
+        capture_output=True, timeout=1800,
+    )
+    if result.returncode != 0:
+        raise PipelineError(
+            "ffmpeg could not prepare the audio for the transcription API: "
+            + result.stderr.decode(errors="replace").strip()[:300]
+        )
+    return sorted(out_dir.glob("chunk_*.mp3"))
+
+
+def _post_transcription(chunk: Path) -> dict:
+    """One request to the OpenAI-compatible /audio/transcriptions endpoint; returns the verbose JSON."""
+    with chunk.open("rb") as fh:
+        response = httpx.post(
+            f"{STT_BASE_URL}/audio/transcriptions",
+            headers={"Authorization": f"Bearer {STT_API_KEY}"},
+            files={"file": (chunk.name, fh, "audio/mpeg")},
+            data={"model": STT_MODEL, "response_format": "verbose_json", "language": "en"},
+            timeout=600,
+        )
+    if response.status_code != 200:
+        raise PipelineError(f"Transcription API error {response.status_code}: {response.text[:300]}")
+    return response.json()
+
+
+def transcribe_audio_api(audio_path: Path) -> list[Segment]:
+    """Blocking. Uploads the audio chunk by chunk to the transcription API and stitches the timestamps."""
+    segments: list[Segment] = []
+    offset = 0.0
+    for chunk in _split_audio_for_api(audio_path, audio_path.parent / "chunks"):
+        try:
+            payload = _post_transcription(chunk)
+        except httpx.HTTPError as exc:
+            raise PipelineError(f"Could not reach the transcription API: {exc}") from exc
+        chunk_segments = payload.get("segments") or []
+        duration = float(payload.get("duration") or STT_CHUNK_MINUTES * 60)
+        if not chunk_segments and payload.get("text", "").strip():  # provider returned plain text only
+            chunk_segments = [{"start": 0.0, "end": duration, "text": payload["text"]}]
+        for seg in chunk_segments:
+            text = str(seg.get("text", "")).strip()
+            if text:
+                segments.append((offset + float(seg["start"]), offset + float(seg["end"]), text))
+        offset += duration
+    return segments
+
+
+def transcribe_audio(audio_path: Path, video_id: str) -> list[Segment]:
+    """Blocking. Returns the English transcript as (start, end, text) segments, via the configured backend."""
+    segments = transcribe_audio_api(audio_path) if TRANSCRIBER == "api" else transcribe_audio_local(audio_path)
     words = sum(len(text.split()) for _, _, text in segments)
     if not words:
         raise PipelineError("Transcription produced no text. Is there English speech in the video?")
-    log.info("Transcribed %.0fs of audio into %d words.", info.duration, words)
+    log.info("Transcribed %.0fs of audio into %d words (%s).", segments[-1][1], words, TRANSCRIBER)
     return segments
 
 
@@ -1027,6 +1096,10 @@ def _check_config() -> None:
         problems.append(f"OBSIDIAN_VAULT_PATH is not a directory: {VAULT_PATH}")
     if YTDLP_COOKIES_FILE and not Path(YTDLP_COOKIES_FILE).is_file():
         problems.append(f"YTDLP_COOKIES_FILE does not exist: {YTDLP_COOKIES_FILE}")
+    if TRANSCRIBER not in {"local", "api"}:
+        problems.append(f"TRANSCRIBER must be 'local' or 'api', not {TRANSCRIBER!r}")
+    elif TRANSCRIBER == "api" and not STT_API_KEY:
+        problems.append("TRANSCRIBER=api needs STT_API_KEY")
     if problems:
         for p in problems:
             log.error("Config error: %s", p)
@@ -1045,7 +1118,10 @@ def main() -> None:
 
     _check_config()
     log.info("Notes will be written to %s", VAULT_PATH)
-    get_whisper_model()  # load (and on first run download) the model before accepting jobs
+    if TRANSCRIBER == "local":
+        get_whisper_model()  # load (and on first run download) the model before accepting jobs
+    else:
+        log.info("Transcription via API: %s at %s", STT_MODEL, STT_BASE_URL)
 
     app = (
         Application.builder()
