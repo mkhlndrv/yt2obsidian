@@ -16,6 +16,7 @@ import base64
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -273,6 +274,15 @@ STT_CHUNK_MINUTES = 20  # uploads are capped at 25 MB; 20 min of 32 kbps mono mp
 def _env_flag(name: str, default: str = "true") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
+
+# Attach the finished .md file to the Telegram chat. Turn off when the vault syncs by itself.
+SEND_NOTE_FILE = _env_flag("SEND_NOTE_FILE")
+
+# Shell command to run after each note is written, with {path} replaced by the note's path.
+# Typical use: upload the note to storage your vault syncs from, e.g.
+#   aws s3 cp {path} s3://my-vault/YouTube/      (Remotely Save plugin on your devices, S3 backend)
+#   rclone copy {path} dropbox:Vault/YouTube     (any rclone remote)
+AFTER_NOTE_COMMAND = os.environ.get("AFTER_NOTE_COMMAND", "").strip()
 
 # Append the full timestamped transcript to the note in a folded section (searchable in Obsidian).
 INCLUDE_TRANSCRIPT = _env_flag("INCLUDE_TRANSCRIPT")
@@ -964,6 +974,22 @@ def write_note(note: str, meta: VideoMeta) -> Path:
     return path
 
 
+def run_after_note_command(path: Path) -> None:
+    """Blocking. Runs AFTER_NOTE_COMMAND for a freshly written note; raises PipelineError on failure."""
+    # shell=True is intentional: the command is the operator's own .env setting (pipes and redirects
+    # allowed), and the only value substituted into it is the note path, quoted with shlex.quote so a
+    # video title can never inject shell syntax.
+    command = AFTER_NOTE_COMMAND.replace("{path}", shlex.quote(str(path)))
+    try:
+        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired as exc:
+        raise PipelineError(f"AFTER_NOTE_COMMAND timed out after 600s: {command}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[:300]
+        raise PipelineError(f"AFTER_NOTE_COMMAND failed (exit {result.returncode}): {detail}")
+    log.info("AFTER_NOTE_COMMAND ran for %s", path.name)
+
+
 # =============================================================================
 # Telegram bot
 # =============================================================================
@@ -1045,16 +1071,25 @@ async def process_video(video_id: str, chat_id: int, context: ContextTypes.DEFAU
         if INCLUDE_TRANSCRIPT:
             note = append_transcript(note, transcript)
         path = await asyncio.to_thread(write_note, note, meta)
-        try:
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=path.read_bytes(),
-                filename=path.name,
-                caption=f"✅ {path.stem}\nSave this file into your Obsidian vault.",
-            )
-        except TelegramError as exc:
-            log.warning("Could not send the note file to Telegram: %s", exc)
-            await say(f"⚠️ The note was saved at {path}, but sending the file failed: {exc}")
+        if AFTER_NOTE_COMMAND:
+            try:
+                await asyncio.to_thread(run_after_note_command, path)
+            except PipelineError as exc:
+                log.warning("%s", exc)
+                await say(f"⚠️ {exc}")
+        if not SEND_NOTE_FILE:
+            await say(f"✅ Note saved: {path.stem}")
+        else:
+            try:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=path.read_bytes(),
+                    filename=path.name,
+                    caption=f"✅ {path.stem}\nSave this file into your Obsidian vault.",
+                )
+            except TelegramError as exc:
+                log.warning("Could not send the note file to Telegram: %s", exc)
+                await say(f"⚠️ The note was saved at {path}, but sending the file failed: {exc}")
         log.info("Job finished for video %s", video_id)
 
     except PipelineError as exc:

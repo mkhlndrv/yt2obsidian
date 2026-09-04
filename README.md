@@ -18,7 +18,7 @@ that file, so the note format is a text edit away.
 | `bot.py` | The whole bot: Telegram handlers, yt-dlp download, faster-whisper transcription, Claude screenshot selection and note writing, file delivery. |
 | `tests/` | Helper tests plus stub-driven tests of the Telegram and Claude layers; no network or API key needed. |
 | `eval/` | Cross-genre evaluation harness: eight real videos through the full pipeline, with cached transcripts and screenshots for fast prompt iteration. |
-| `deploy/` | First-boot script for an AWS EC2 instance (see "Deploy on AWS"). |
+| `deploy/` | First-boot script for an AWS EC2 instance, and the Obsidian-on-the-server installer for Obsidian Sync. |
 | `.env.example` | Every configuration variable with its default. |
 
 ## Setup (Ubuntu)
@@ -212,13 +212,42 @@ needs no extra account.
 **Cost:** a `t4g.medium` runs in the region of $25 a month on-demand and a `t3.medium` about
 $30; the API calls add a few cents per video. Check the EC2 pricing page for your region.
 
-## Optional: sync the notes folder automatically
+## Automatic sync into your vault
 
-Saving the Telegram file by hand is the simplest workflow and needs no extra setup. If you
-would rather have notes appear in the vault on their own, set `OBSIDIAN_VAULT_PATH` to a
-folder inside a synced vault. On a Mac that can be an iCloud vault or one using Obsidian
-Sync (Obsidian must be open to sync). Neither works on a headless server, so there the
-option is [Syncthing](https://syncthing.net/), with Möbius Sync as the iOS client:
+Saving the Telegram file by hand needs no setup. To have notes appear in the vault on their
+own, use one of the routes below and set `SEND_NOTE_FILE=false` so the bot just confirms
+each note instead of attaching it.
+
+**Option A: Remotely Save plugin + an S3 bucket (free, recommended on AWS).** The
+[Remotely Save](https://github.com/remotely-save/remotely-save) community plugin syncs an
+Obsidian vault with cloud storage and runs on iPhone, Mac, and desktop. The server side needs
+no Obsidian at all: the bot uploads each finished note to the bucket, and your devices pull it
+into the vault. S3 storage for a vault costs cents per month.
+
+1. **Bucket and keys.** In the AWS console create a private S3 bucket (say `my-vault`) and an
+   IAM user whose only permission is that bucket; download its access key. On the server,
+   the simplest is an instance role with access to the bucket, otherwise `aws configure` with
+   the same key.
+2. **Server.** `sudo apt install -y awscli`, then in `.env`:
+
+   ```bash
+   AFTER_NOTE_COMMAND=aws s3 cp {path} s3://my-vault/YouTube/
+   SEND_NOTE_FILE=false
+   ```
+
+   and restart the bot. Every note now lands in `YouTube/` in the bucket. A failed upload
+   comes back as a Telegram warning; the note is still saved on the server.
+3. **Devices.** In Obsidian on the phone and the Mac install Remotely Save, choose S3, enter
+   the endpoint `https://s3.<region>.amazonaws.com`, the region, the access key, the secret,
+   and the bucket name, then run a sync and turn on auto-sync in its settings. New notes
+   appear under `YouTube/` in the vault.
+
+Remotely Save also speaks Dropbox, OneDrive, Google Drive, and WebDAV; with
+[rclone](https://rclone.org/) on the server, the same one-liner works for those:
+`AFTER_NOTE_COMMAND=rclone copy {path} dropbox:Vault/YouTube`.
+
+**Option B: [Syncthing](https://syncthing.net/), free and peer-to-peer.** Syncs the vault
+folder directly between devices; the iOS client, Möbius Sync, is a one-time paid app:
 
 1. **Server.** Install and start Syncthing for your user:
 
@@ -249,6 +278,15 @@ option is [Syncthing](https://syncthing.net/), with Möbius Sync as the iOS clie
 Syncthing creates a small `.stfolder` marker inside the vault; Obsidian ignores it. New notes
 appear on the phone when Möbius Sync runs, which is whenever the app is open plus the short
 background windows iOS grants it.
+
+**Option C: Obsidian Sync (paid subscription).** Obsidian Sync only works inside the Obsidian
+app, so this route runs the desktop app on the server on a virtual display, signed in, with
+the vault open; it then pushes notes to your devices natively, background sync included.
+`sudo bash deploy/obsidian-server.sh` installs Obsidian (x86 `.deb` or ARM AppImage), the
+virtual display, and two systemd services, and prints the one-time VNC sign-in steps. Needs
+about 500 MB of extra RAM on the server. Afterwards set
+`OBSIDIAN_VAULT_PATH=/home/ubuntu/vault/YouTube` and check once that the sign-in survives
+`sudo systemctl restart obsidian`.
 
 ## Development
 

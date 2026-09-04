@@ -1,5 +1,5 @@
 """Exercise generate_note() and the Telegram handlers with stubbed Anthropic / Telegram objects."""
-import os, sys, asyncio, types
+import os, sys, asyncio, types, shlex
 os.environ.update(TELEGRAM_BOT_TOKEN="x", ANTHROPIC_API_KEY="x", OBSIDIAN_VAULT_PATH=__import__("tempfile").mkdtemp(prefix="yt2obsidian-test-"))
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import anthropic, httpx2 as httpx
@@ -243,13 +243,38 @@ async def main():
     bot.INCLUDE_FRAMES = False
     print("frames flow OK (Claude-gated, image sent, extraction failure tolerated)")
 
+    # SEND_NOTE_FILE=false: the note is saved and confirmed, no file is attached
+    n_docs = len(docs)
+    bot.SEND_NOTE_FILE = False
+    bot._anthropic_client, _ = fake_client(fake_message(note_text))
+    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    assert sent[-1][1].startswith("✅ Note saved: A Talk") and len(docs) == n_docs, (sent[-1], len(docs) - n_docs)
+    bot.SEND_NOTE_FILE = True
+    print("SEND_NOTE_FILE=false OK")
+
+    # AFTER_NOTE_COMMAND: runs with the note path substituted; a failing command warns but keeps the note
+    marker = pathlib.Path(os.environ["OBSIDIAN_VAULT_PATH"]) / "uploaded.txt"
+    bot.AFTER_NOTE_COMMAND = f"cat {{path}} > {shlex.quote(str(marker))}"
+    bot._anthropic_client, _ = fake_client(fake_message(note_text))
+    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    assert marker.read_text() == note_text + "\n", marker.read_text()[:80]
+    assert not sent[-1][1].startswith("⚠️"), sent[-1]
+    bot.AFTER_NOTE_COMMAND = "exit 3"
+    bot._anthropic_client, _ = fake_client(fake_message(note_text))
+    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    assert any(t.startswith("⚠️ AFTER_NOTE_COMMAND failed (exit 3)") for _, t in sent[-2:]), sent[-2:]
+    assert docs[-1][2].startswith("A Talk"), docs[-1][2]   # the file was still delivered
+    bot.AFTER_NOTE_COMMAND = ""
+    print("AFTER_NOTE_COMMAND OK")
+
     # send_document failure -> note kept, clear warning
     from telegram.error import NetworkError
     async def bad_send_document(**kw): raise NetworkError("boom")
     ctx.bot.send_document = bad_send_document
+    n_files = len(list(v.glob("A Talk*.md")))
     await bot.process_video("dQw4w9WgXcQ", 7, ctx)
     assert sent[-1][1].startswith("⚠️ The note was saved at") and "boom" in sent[-1][1], sent[-1]
-    assert (v / "A Talk (6).md").exists()
+    assert len(list(v.glob("A Talk*.md"))) == n_files + 1
     shutil.rmtree(v)
     print("send_document failure path OK")
     print("ALL STUB TESTS PASSED")
