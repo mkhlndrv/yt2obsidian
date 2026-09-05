@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import logging
 import os
 import re
@@ -1172,6 +1173,11 @@ async def process_video(video_id: str, chat_id: int, context: ContextTypes.DEFAU
     except PipelineError as exc:
         log.warning("Job failed for video %s: %s", video_id, exc)
         await status.fail(str(exc))
+    except asyncio.CancelledError:  # the bot is shutting down (restart, deploy, OS update) mid-job
+        log.warning("Job for video %s cancelled by shutdown", video_id)
+        with contextlib.suppress(Exception):
+            await status.fail("The bot restarted while processing. Send the link again.")
+        raise
     except Exception as exc:  # noqa: BLE001 - last resort: never fail silently
         log.exception("Unexpected error while processing video %s", video_id)
         await status.fail(f"Unexpected error ({exc.__class__.__name__}): {exc}")

@@ -187,6 +187,14 @@ async def main():
     bot.download_audio = crash
     await bot.process_video("dQw4w9WgXcQ", 7, ctx)
     assert status() == "Failed\n\nUnexpected error (RuntimeError): weird", status()
+    # shutdown mid-job: the status message says so and the cancellation still propagates
+    def cancelled(*a, **k): raise asyncio.CancelledError()
+    bot.download_audio = cancelled
+    try:
+        await bot.process_video("dQw4w9WgXcQ", 7, ctx); raise AssertionError("cancellation swallowed")
+    except asyncio.CancelledError:
+        pass
+    assert status() == "Failed\n\nThe bot restarted while processing. Send the link again.", status()
     print("process_video error reporting OK")
 
     # process_video full flow with stubbed steps -> file written, stage messages sent
