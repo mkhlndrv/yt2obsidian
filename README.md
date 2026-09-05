@@ -153,6 +153,8 @@ All settings live in `.env` (see `.env.example`). Only the first two are require
 | `SEND_NOTE_FILE` | `true` | Attach the finished `.md` to the chat. Set `false` once the vault syncs by itself. |
 | `AFTER_NOTE_COMMAND` | empty | Shell command run after each note, `{path}` replaced by the file. Typically an upload, e.g. `aws s3 cp {path} s3://my-vault/YouTube/`. |
 | `CLAUDE_MODEL` | `claude-sonnet-5` | Model that writes the note. |
+| `NOTE_BACKEND` | `api` | `api` (Anthropic API, metered) or `claude-code` (the Claude Code CLI on this machine with a Pro/Max subscription); see [Running on a Claude subscription](#running-on-a-claude-subscription-instead-of-the-api). |
+| `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_BIN` | | Token from `claude setup-token`; path to the `claude` binary if not on PATH. Only for `NOTE_BACKEND=claude-code`. |
 | `TRANSCRIBER` | `local` | `local` (faster-whisper on this machine) or `api` (OpenAI-compatible endpoint). |
 | `STT_API_KEY`, `STT_BASE_URL`, `STT_MODEL` | OpenAI defaults | Transcription API settings; see [Faster transcription](#faster-transcription). |
 | `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE` | `distil-large-v3`, `cpu`, `int8` | Local model settings. `cuda` + `float16` on an NVIDIA GPU. |
@@ -225,6 +227,35 @@ STT_MODEL=whisper-large-v3-turbo                 # OpenAI: whisper-1
 The audio is re-encoded to small mono chunks (about 5 MB per 20 minutes), each chunk is
 uploaded, and the timestamps are stitched back together, so long videos work and the note is
 unchanged. The local backend stays the default and needs no extra account.
+
+## Running on a Claude subscription instead of the API
+
+If you pay for Claude Pro or Max, the bot can use the **Claude Code CLI** on the server for the
+two Claude calls (screenshot selection and the note) instead of the metered API. Claude Code's
+headless mode is an official feature, the calls count against your subscription's usage limits
+rather than a bill, and the notes are the same. Only Claude Code itself may use a subscription
+login; the bot therefore runs the `claude` command and never touches the token directly.
+
+Trade-offs: each call adds a few seconds of CLI start-up, screenshots are read from disk by
+the CLI rather than sent inline, and a busy day can hit the five-hour usage window (Max has
+plenty of room; Pro is tight for screenshot-heavy notes). If a call is rate-limited the job
+fails with the CLI's message and you can resend later.
+
+1. **Install Claude Code on the server:** `curl -fsSL https://claude.ai/install.sh | bash`
+   (it lands in `~/.local/bin/claude`).
+2. **Get a long-lived token** on a machine with a browser: `claude setup-token`, sign in
+   with your subscription, copy the token it prints.
+3. **In `.env`** on the server:
+
+   ```bash
+   NOTE_BACKEND=claude-code
+   CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
+   CLAUDE_CODE_BIN=/home/ubuntu/.local/bin/claude
+   ```
+
+   `ANTHROPIC_API_KEY` can stay for the record, but the bot deliberately does not pass it to
+   the CLI, so nothing is billed to it. Restart the bot; the log line `Note backend:
+   claude-code` confirms the switch.
 
 ## Automatic sync into your vault
 

@@ -75,6 +75,43 @@ async def main():
     assert await bot.find_screen_cues([(0.0, 1.0, "hello")], meta) == []
     print("find_screen_cues OK")
 
+    # Claude Code backend: CLI envelopes are parsed, frames are passed as files, the API key never reaches the CLI
+    calls_cc = []
+    async def fake_cli(args, stdin_text):
+        calls_cc.append((args, stdin_text))
+        if "--allowedTools" in args:   # the note call with frames: every listed file must exist right now
+            for line in stdin_text.splitlines():
+                if line.startswith("- /") and ".jpg" in line:
+                    assert os.path.exists(line.split(" — ")[0][2:]), line
+            return {"is_error": False, "result": note_text, "usage": {"input_tokens": 9, "output_tokens": 4}}
+        if "Reply with JSON only" in stdin_text:
+            return {"is_error": False, "result": '```json\n{"moments": [{"seconds": 30, "why": "chart"}, {"seconds": 31, "why": "same"}]}\n```', "usage": {}}
+        return {"is_error": False, "result": note_text, "usage": {}}
+    bot._run_claude_code = fake_cli
+    bot.NOTE_BACKEND = "claude-code"
+    cues = await bot.find_screen_cues([(0.0, 1.0, "look at this chart")], meta)
+    assert cues == [(30.0, "chart")], cues
+    assert calls_cc[-1][0][:2] == ["--system-prompt", bot.CUE_PROMPT.format(max_moments=bot.FRAMES_MAX)] and "--allowedTools" not in calls_cc[-1][0]
+    note = await bot.generate_note(meta, "hello transcript", frames=[(12.0, "the code", b"\xff\xd8x")])
+    assert note == note_text + "\n", note
+    args, stdin_text = calls_cc[-1]
+    assert args[:4] == ["--system-prompt", bot.SYSTEM_PROMPT, "--model", bot.CLAUDE_MODEL] and "--add-dir" in args, args
+    assert "frame_00.jpg — frame at [0:12](https://youtu.be/dQw4w9WgXcQ?t=12) (the code)" in stdin_text and "hello transcript" in stdin_text
+    note = await bot.generate_note(meta, "t", frames=[])
+    assert "--allowedTools" not in calls_cc[-1][0] and calls_cc[-1][0][-2:] == ["--max-turns", "1"], calls_cc[-1][0]
+    async def cli_error(args, stdin_text): raise bot.PipelineError("Claude Code error: usage limit reached")
+    bot._run_claude_code = cli_error
+    assert await bot.find_screen_cues([(0.0, 1.0, "x")], meta) == []      # screenshots are optional
+    try:
+        await bot.generate_note(meta, "t"); raise AssertionError("no error")
+    except bot.PipelineError as e:
+        assert "usage limit" in str(e), e
+    os.environ["ANTHROPIC_API_KEY"] = "secret"
+    assert "ANTHROPIC_API_KEY" not in bot._claude_code_env() and "PATH" in bot._claude_code_env()
+    assert bot._extract_json('Sure: {"a": 1} done') == '{"a": 1}' and bot._extract_json('```json\n{"a":\n1}\n```') == '{"a":\n1}'
+    bot.NOTE_BACKEND = "api"
+    print("claude-code backend OK")
+
     # transcribe_audio via the API backend: chunks are stitched with time offsets; failures are clear
     import httpx as _httpx
     from pathlib import Path as _P

@@ -14,10 +14,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import logging
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -256,6 +258,19 @@ ALLOWED_USER_IDS = {
 
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
 CLAUDE_MAX_TOKENS = 16000
+
+# Which Claude answers the screenshot-selection and note-writing calls.
+#   api          the Anthropic API with ANTHROPIC_API_KEY (metered, default)
+#   claude-code  the Claude Code CLI installed on this machine, signed in with a Claude Pro/Max
+#                subscription: no per-token cost, the subscription's rate limits apply. Put the
+#                token from `claude setup-token` in CLAUDE_CODE_OAUTH_TOKEN.
+NOTE_BACKEND = os.environ.get("NOTE_BACKEND", "api").strip().lower()
+CLAUDE_CODE_BIN = (
+    os.environ.get("CLAUDE_CODE_BIN", "").strip()
+    or shutil.which("claude")
+    or str(Path.home() / ".local" / "bin" / "claude")
+)
+CLAUDE_CODE_TIMEOUT = 900  # seconds per call
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "distil-large-v3")
 WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
@@ -607,6 +622,20 @@ async def find_screen_cues(segments: list[Segment], meta: VideoMeta) -> list[Cue
         f"Description (truncated): {meta.description or '(none)'}\n\n"
         f"TRANSCRIPT SEGMENTS (start seconds: text):\n{lines}"
     )
+    if NOTE_BACKEND == "claude-code":
+        prompt += (
+            '\n\nReply with JSON only, no prose, exactly in this shape: '
+            '{"moments": [{"seconds": 123, "why": "short reason"}]}'
+        )
+        try:
+            text, _usage = await claude_code_complete(CUE_PROMPT.format(max_moments=FRAMES_MAX), prompt, CUE_MODEL)
+            moments = ScreenMoments.model_validate_json(_extract_json(text)).moments
+        except (PipelineError, ValueError) as exc:  # pydantic's ValidationError is a ValueError
+            log.warning("Screenshot selection failed; continuing without screenshots: %s", exc)
+            return []
+        cues = normalize_cues([(m.seconds, m.why) for m in moments], meta.duration_seconds)
+        log.info("Claude picked %d screenshot moments (%d proposed).", len(cues), len(moments))
+        return cues
     try:
         response = await get_anthropic().messages.parse(
             model=CUE_MODEL,
@@ -821,6 +850,58 @@ def get_anthropic() -> anthropic.AsyncAnthropic:
     return _anthropic_client
 
 
+def _claude_code_env() -> dict[str, str]:
+    """Environment for the CLI: never pass the API key, or the call would be billed to it instead of the subscription."""
+    return {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+
+
+async def _run_claude_code(args: list[str], stdin_text: str) -> dict:
+    """Run the Claude Code CLI headlessly with the prompt on stdin; return its JSON result envelope."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            CLAUDE_CODE_BIN, "-p", "--output-format", "json", "--no-session-persistence", *args,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_claude_code_env(),
+        )
+    except FileNotFoundError as exc:
+        raise PipelineError(f"Claude Code CLI not found at {CLAUDE_CODE_BIN}") from exc
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(stdin_text.encode()), timeout=CLAUDE_CODE_TIMEOUT)
+    except asyncio.TimeoutError as exc:
+        proc.kill()
+        raise PipelineError(f"Claude Code did not answer within {CLAUDE_CODE_TIMEOUT} s") from exc
+    try:
+        envelope = json.loads(out.decode())
+    except ValueError as exc:
+        detail = (err or out).decode(errors="replace").strip()[:300]
+        raise PipelineError(f"Claude Code returned no result (exit {proc.returncode}): {detail}") from exc
+    if envelope.get("is_error") or proc.returncode != 0:
+        detail = str(envelope.get("result") or err.decode(errors="replace")).strip()[:300]
+        raise PipelineError(f"Claude Code error: {detail}")
+    return envelope
+
+
+async def claude_code_complete(
+    system: str, prompt: str, model: str, *, add_dir: str | None = None, max_turns: int = 1
+) -> tuple[str, dict]:
+    """One headless Claude Code call. Returns (result text, usage). With add_dir, the Read tool may open files there."""
+    args = ["--system-prompt", system, "--model", model, "--max-turns", str(max_turns)]
+    if add_dir:
+        args += ["--allowedTools", "Read", "--add-dir", add_dir]
+    envelope = await _run_claude_code(args, prompt)
+    return str(envelope.get("result") or ""), envelope.get("usage") or {}
+
+
+def _extract_json(text: str) -> str:
+    """Pull the JSON object out of a reply that may wrap it in prose or a code fence."""
+    text = text.strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
+    if fenced:
+        return fenced.group(1)
+    start, end = text.find("{"), text.rfind("}")
+    return text[start : end + 1] if start != -1 and end > start else text
+
+
 # A bare "5:15" / "1:02:05" that is not already the text of a Markdown link.
 _BARE_TIMESTAMP_RE = re.compile(r"(?<![\[\w/:.])(\d{1,2}:\d{2}(?::\d{2})?)(?![\]\w/:.])")
 
@@ -904,6 +985,9 @@ async def generate_note(meta: VideoMeta, transcript: str, frames: list[Frame] = 
         description=meta.description or "(none)",
         transcript=transcript,
     )
+    if NOTE_BACKEND == "claude-code":
+        return await _generate_note_claude_code(meta, prompt, frames)
+
     content: list[dict] = []
     if frames:
         content.append({"type": "text", "text": FRAMES_INTRO})
@@ -950,6 +1034,36 @@ async def generate_note(meta: VideoMeta, transcript: str, frames: list[Frame] = 
     log.info(
         "Claude usage: %d input / %d output tokens (%s, %d screenshots).",
         message.usage.input_tokens, message.usage.output_tokens, CLAUDE_MODEL, len(frames),
+    )
+    return _clean_note(text, meta)
+
+
+async def _generate_note_claude_code(meta: VideoMeta, prompt: str, frames: list[Frame]) -> str:
+    """Same note, written by the Claude Code CLI; screenshots are passed as files it reads itself."""
+    with tempfile.TemporaryDirectory(prefix="yt2obsidian-frames-") as tmp:
+        parts: list[str] = []
+        if frames:
+            listing = []
+            for i, (seconds, why, data) in enumerate(frames):
+                path = Path(tmp) / f"frame_{i:02d}.jpg"
+                path.write_bytes(data)
+                listing.append(f"- {path} — frame at {timestamp_link(meta.video_id, seconds)} ({why})")
+            parts.append(
+                FRAMES_INTRO
+                + "\nThe frames are image files; open every one of them with the Read tool before writing:\n"
+                + "\n".join(listing)
+            )
+        parts.append(prompt)
+        text, usage = await claude_code_complete(
+            SYSTEM_PROMPT, "\n\n".join(parts), CLAUDE_MODEL,
+            add_dir=tmp if frames else None,
+            max_turns=min(30, 3 + len(frames)) if frames else 1,
+        )
+    if not text.strip():
+        raise PipelineError("Claude Code returned an empty response.")
+    log.info(
+        "Claude Code usage: %s input / %s output tokens (%s, %d screenshots).",
+        usage.get("input_tokens", "?"), usage.get("output_tokens", "?"), CLAUDE_MODEL, len(frames),
     )
     return _clean_note(text, meta)
 
@@ -1202,8 +1316,12 @@ def _check_config() -> None:
     problems = []
     if not TELEGRAM_BOT_TOKEN:
         problems.append("TELEGRAM_BOT_TOKEN is not set")
-    if not ANTHROPIC_API_KEY:
-        problems.append("ANTHROPIC_API_KEY is not set")
+    if NOTE_BACKEND not in {"api", "claude-code"}:
+        problems.append(f"NOTE_BACKEND must be 'api' or 'claude-code', not {NOTE_BACKEND!r}")
+    elif NOTE_BACKEND == "api" and not ANTHROPIC_API_KEY:
+        problems.append("ANTHROPIC_API_KEY is not set (or set NOTE_BACKEND=claude-code)")
+    elif NOTE_BACKEND == "claude-code" and not (shutil.which(CLAUDE_CODE_BIN) or Path(CLAUDE_CODE_BIN).is_file()):
+        problems.append(f"NOTE_BACKEND=claude-code but the Claude Code CLI was not found at {CLAUDE_CODE_BIN} (CLAUDE_CODE_BIN)")
     if not VAULT_PATH.exists():
         if VAULT_PATH.parent.is_dir():
             VAULT_PATH.mkdir()
@@ -1236,6 +1354,10 @@ def main() -> None:
 
     _check_config()
     log.info("Notes will be written to %s", VAULT_PATH)
+    log.info(
+        "Note backend: %s (%s)", NOTE_BACKEND,
+        CLAUDE_MODEL if NOTE_BACKEND == "api" else f"{CLAUDE_MODEL} via {CLAUDE_CODE_BIN}",
+    )
     if TRANSCRIBER == "local":
         get_whisper_model()  # load (and on first run download) the model before accepting jobs
     else:
