@@ -60,13 +60,23 @@ Each link goes through six steps, all in `bot.py`:
 2. **Transcribe.** Either locally with faster-whisper (`distil-large-v3`, int8, English
    only, no account needed) or through an OpenAI-compatible speech-to-text API (OpenAI or
    Groq), which is about 100 times faster. Segments keep their timestamps.
-3. **Pick screenshots.** Speech alone misses what is only on screen. Claude reads the
-   timestamped transcript once (a cheap, low-effort call with a structured JSON reply) and
-   returns the moments where the screen carries information the words don't: code, slides,
-   charts, tables, a UI being walked through. Only then is a small video-only stream fetched;
-   a frame is grabbed at each moment, near-duplicates are dropped, and up to 30 frames go to
-   the next step labelled with their timestamps. A talk with nothing on screen gets no
-   screenshots and no video download.
+3. **Pick screenshots.** Speech alone misses what is only on screen. Two sources feed the
+   same pipeline, and the rule depends on the video, not the platform:
+   - *Transcript-chosen moments*, for any video with speech. Claude reads the timestamped
+     transcript once (a cheap, low-effort call with a structured JSON reply) and returns the
+     moments where the screen carries information the words don't: code, slides, charts,
+     tables, a UI being walked through.
+   - *A visual scan*, for any video up to `FRAMES_SCAN_MAX_MINUTES` (default 5): reels,
+     tweet clips, Shorts. The video is decoded once at thumbnail size and a frame is taken
+     wherever the picture changes, thinned evenly to `FRAMES_SCAN_MAX`. A talking head yields
+     one or two frames, a slideshow one per slide, a silent clip still gets covered. Longer
+     videos rely on the transcript-chosen moments alone, because sampling a long video on a
+     timer both misses things and wastes tokens.
+
+   A frame is grabbed at each moment, near-duplicates are dropped, and up to 30 frames go to
+   the next step labelled with their timestamps. For YouTube the small video-only stream is
+   fetched only when something will be taken from it. Clips without an audio track skip
+   transcription, and a clip with music but no speech gets an empty transcript, not an error.
 4. **Write the note.** Claude gets the transcript, the post's own text, the metadata, the
    chapters, the frames, and any attached images, plus a fixed template and a rule set, and
    writes the note. Videos get the full template; posts, reels, and tweets get a short-form
@@ -185,6 +195,7 @@ All settings live in `.env` (see `.env.example`). Only the first two are require
 | `INCLUDE_FRAMES` | `true` | Screenshots on or off. |
 | `CUE_MODEL` | same as `CLAUDE_MODEL` | Model for the screenshot-selection pass. |
 | `FRAMES_MAX`, `FRAMES_VIDEO_HEIGHT` | `30`, `720` | Most screenshots per video; resolution of the video stream fetched for them. |
+| `FRAMES_SCAN_MAX_MINUTES`, `FRAMES_SCAN_MAX` | `5`, `12` | Videos up to this length also get the visual scan (0 turns it off); most scan frames per video. |
 | `INCLUDE_TRANSCRIPT` | `true` | Append the full timestamped transcript in a folded section. |
 | `MAX_VIDEO_MINUTES` | `0` (no limit) | Refuse longer videos. |
 | `YTDLP_COOKIES_FILE` | empty | Netscape-format cookies file; needed for YouTube on most cloud servers and always for Instagram. One file can hold both sites' cookies. |
@@ -374,9 +385,9 @@ display, and two systemd services, and prints the one-time VNC sign-in steps. Ne
 - **English only** with the default local model. For other languages set
   `WHISPER_MODEL=large-v3` (slower) and remove `language="en"` in `transcribe_audio_local`,
   or use the API backend, which handles any language.
-- **Screenshots are chosen from the transcript.** A slide deck whose presenter never refers
-  to the slides gets no screenshots. That is the trade-off of not sampling frames on a timer,
-  which wasted tokens on illustrations.
+- **Long videos get screenshots only from the transcript.** Past `FRAMES_SCAN_MAX_MINUTES`,
+  a slide deck whose presenter never refers to the slides gets no screenshots. That is the
+  trade-off of not sampling a long video on a timer, which wasted tokens on illustrations.
 - **Model variance.** Occasionally a note drops a fence or keeps a mis-heard name; the
   structural slips are repaired in code, the rare content-level ones are not.
 - **`Sign in to confirm you're not a bot`** from YouTube: see the cookies step under Deploy.

@@ -261,8 +261,8 @@ Write the complete note now.\
 # =============================================================================
 
 CUE_PROMPT = """\
-You pick the moments of a YouTube video worth screenshotting so that someone who reads the \
-notes instead of watching still sees what was on screen.
+You pick the moments of a video worth screenshotting so that someone who reads the notes \
+instead of watching still sees what was on screen.
 
 You get the transcript as segments, each prefixed with its start time in seconds. Return the \
 moments where the speaker refers to, reads from, demonstrates, or walks through something shown \
@@ -418,6 +418,15 @@ FRAMES_MAX = int(os.environ.get("FRAMES_MAX", "30") or 30)  # most screenshots s
 FRAMES_VIDEO_HEIGHT = int(os.environ.get("FRAMES_VIDEO_HEIGHT", "720") or 720)  # video stream to download
 FRAME_MIN_GAP_SECONDS = 4.0  # cues closer together than this share one frame
 FRAME_CHANGE_THRESHOLD = 12.0  # mean pixel difference (0-255) vs the last kept frame; lower = more frames
+
+# Visual scan. For a short video (a reel, a tweet's clip, a Short) the picture usually is the point and nobody
+# describes it, so any video up to FRAMES_SCAN_MAX_MINUTES is also decoded once at thumbnail size and a frame is
+# taken wherever the picture changes, thinned evenly to FRAMES_SCAN_MAX. A talking head yields one or two frames,
+# a slideshow one per slide. Longer videos rely on the transcript-chosen moments alone. 0 minutes turns it off.
+FRAMES_SCAN_MAX_MINUTES = float(os.environ.get("FRAMES_SCAN_MAX_MINUTES", "5") or 0)
+FRAMES_SCAN_MAX = int(os.environ.get("FRAMES_SCAN_MAX", "12") or 12)
+SCAN_FPS = 2  # samples per second during the scan
+SCAN_MIN_GAP_SECONDS = 1.5  # scan frames are never closer than this, which rides out cuts and fades
 
 # Optional: refuse videos longer than this (0 = no limit) and a cookies file for yt-dlp.
 MAX_VIDEO_MINUTES = int(os.environ.get("MAX_VIDEO_MINUTES", "0") or 0)
@@ -1037,6 +1046,55 @@ def extract_frames(video_path: Path, meta: VideoMeta, out_dir: Path, cues: list[
     return frames
 
 
+def scan_wanted(meta: Item) -> bool:
+    """Whether the video is short enough for the visual scan (FRAMES_SCAN_MAX_MINUTES); unknown length means no."""
+    return 0 < meta.duration_seconds <= FRAMES_SCAN_MAX_MINUTES * 60
+
+
+def scan_video(video_path: Path) -> list[Cue]:
+    """Blocking. The moments where a short video's picture changes: the first non-black frame, then every frame
+    that differs from the last kept one by FRAME_CHANGE_THRESHOLD and is SCAN_MIN_GAP_SECONDS or more after it,
+    thinned evenly to FRAMES_SCAN_MAX. One decode at 32x18 grey, so it costs seconds even for a few minutes."""
+    width, height = 32, 18
+    result = subprocess.run(
+        [
+            "ffmpeg", "-loglevel", "error", "-i", str(video_path), "-vf", f"fps={SCAN_FPS},scale={width}:{height}",
+            "-f", "rawvideo", "-pix_fmt", "gray", "-",
+        ],
+        capture_output=True, timeout=900,
+    )
+    if result.returncode != 0:
+        raise PipelineError(
+            "ffmpeg could not read the video for the visual scan: " + result.stderr.decode(errors="replace").strip()[:300]
+        )
+    count = len(result.stdout) // (width * height)
+    thumbs = np.frombuffer(result.stdout[: count * width * height], dtype=np.uint8).reshape(count, height, width)
+    kept: list[Cue] = []
+    previous: np.ndarray | None = None
+    for index, thumb in enumerate(thumbs.astype(np.float32)):
+        seconds = index / SCAN_FPS
+        if thumb.mean() < 20:  # black (16 in limited-range video): a fade or a gap, not a picture
+            continue
+        if previous is None:
+            kept.append((seconds, "opening frame"))
+        elif seconds - kept[-1][0] >= SCAN_MIN_GAP_SECONDS and float(np.abs(thumb - previous).mean()) >= FRAME_CHANGE_THRESHOLD:
+            kept.append((seconds, "the picture changed"))
+        else:
+            continue
+        previous = thumb
+    if len(kept) > FRAMES_SCAN_MAX:
+        picks = sorted(set(np.linspace(0, len(kept) - 1, FRAMES_SCAN_MAX).round().astype(int).tolist()))
+        kept = [kept[i] for i in picks]
+    log.info("Visual scan: %d samples, %d moments kept.", count, len(kept))
+    return kept
+
+
+def merge_cues(chosen: list[Cue], scanned: list[Cue], gap: float = 1.0) -> list[Cue]:
+    """Transcript-chosen moments plus scan moments in time order; a scan moment within `gap` seconds of a chosen one is dropped."""
+    extra = [cue for cue in scanned if all(abs(cue[0] - seconds) >= gap for seconds, _why in chosen)]
+    return sorted([*chosen, *extra], key=lambda cue: cue[0])
+
+
 # =============================================================================
 # Step 2: transcribe with faster-whisper
 # =============================================================================
@@ -1171,12 +1229,28 @@ def transcribe_audio_api(audio_path: Path) -> list[Segment]:
     return segments
 
 
-def transcribe_audio(audio_path: Path, video_id: str) -> list[Segment]:
-    """Blocking. Returns the English transcript as (start, end, text) segments, via the configured backend."""
+def has_audio_stream(path: Path) -> bool:
+    """Blocking. False when ffprobe finds no audio track (muted clips, GIF-style videos); True when unsure."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return result.returncode != 0 or "audio" in result.stdout
+
+
+def transcribe_audio(audio_path: Path, video_id: str, required: bool = True) -> list[Segment]:
+    """Blocking. Returns the English transcript as (start, end, text) segments, via the configured backend.
+    No speech is an error for a video that is all speech (required) and an empty transcript for a post's clip."""
     segments = transcribe_audio_api(audio_path) if TRANSCRIBER == "api" else transcribe_audio_local(audio_path)
     words = sum(len(text.split()) for _, _, text in segments)
     if not words:
-        raise PipelineError("Transcription produced no text. Is there English speech in the video?")
+        if required:
+            raise PipelineError("Transcription produced no text. Is there English speech in the video?")
+        log.info("No speech found in the audio (%s).", TRANSCRIBER)
+        return []
     log.info("Transcribed %.0fs of audio into %d words (%s).", segments[-1][1], words, TRANSCRIBER)
     return segments
 
@@ -1310,10 +1384,15 @@ def append_transcript(note: str, transcript: str) -> str:
 FRAMES_INTRO = (
     "FRAMES: screenshots of the moments a first pass judged to show something informative on "
     "screen, each labelled with the timestamp link of that moment and the reason it was picked, "
-    "plus any images attached to the post, labelled Image N. "
-    "Use them only for informative on-screen content (code, slides, diagrams, charts, tables, UI, "
-    "on-screen text) that the speech does not already convey. Ignore the presenter, backgrounds, "
-    "memes, stock footage, B-roll, and any sponsor or ad screens; those never belong in the note."
+    "plus any images attached to the post, labelled Image N. For a short video the frames also "
+    "include a scan of the picture wherever it changed (labelled 'opening frame' and 'the picture "
+    "changed'), so you can see what the video shows even when nobody describes it. "
+    "In a long video use frames only for informative on-screen content (code, slides, diagrams, "
+    "charts, tables, UI, on-screen text) that the speech does not already convey, and ignore the "
+    "presenter, backgrounds, memes, stock footage and B-roll. In a short post video the frames stand "
+    "in for the clip itself: read any on-screen text, and say what happens on screen when that is "
+    "the point of the post, even if it is just people or places. Sponsor and ad screens never "
+    "belong in the note."
 )
 
 
@@ -1780,26 +1859,40 @@ async def process_item(source: Source, chat_id: int, context: ContextTypes.DEFAU
             await status.step("Downloaded")
 
             transcript, segments = "", []
-            if meta.audio_path is not None:
+            if meta.audio_path is not None and not await asyncio.to_thread(has_audio_stream, meta.audio_path):
+                await status.step("No audio track")
+            elif meta.audio_path is not None:
                 if TRANSCRIBE_LOCK.locked():
                     await status.pending_step("Queued behind another video")
                 async with TRANSCRIBE_LOCK:
                     await status.pending_step("Transcribing")
-                    segments = await asyncio.to_thread(transcribe_audio, meta.audio_path, meta.video_id)
-                transcript = format_transcript(segments, meta)
-                await status.step(f"Transcribed — {transcript_word_count(transcript):,} words")
+                    segments = await asyncio.to_thread(
+                        transcribe_audio, meta.audio_path, meta.video_id, source.kind == "youtube"
+                    )
+                if segments:
+                    transcript = format_transcript(segments, meta)
+                    await status.step(f"Transcribed — {transcript_word_count(transcript):,} words")
+                else:
+                    await status.step("No speech found")
 
-            # Screenshots only at the moments Claude picks; YouTube's video stream is fetched only then.
+            # Screenshots: the moments Claude picks from the transcript, plus a visual scan of a short video.
+            # YouTube's video stream is fetched only when something will be taken from it.
             frames: list[Frame] = []
             cues = await find_screen_cues(segments, meta) if segments and INCLUDE_FRAMES else []
-            if cues:
+            scan = INCLUDE_FRAMES and scan_wanted(meta) and (meta.video_path is not None or source.kind == "youtube")
+            if cues or scan:
                 await status.pending_step("Selecting screenshots")
                 video_path = meta.video_path
                 if video_path is None and source.kind == "youtube":
                     video_path = await asyncio.to_thread(download_video_stream, source.id, Path(tmp))
                 if video_path is not None:
+                    if scan:
+                        try:
+                            cues = merge_cues(cues, await asyncio.to_thread(scan_video, video_path))
+                        except Exception as exc:  # the scan is optional
+                            log.warning("Visual scan failed; continuing with the transcript's moments: %s", exc)
                     try:
-                        frames = await asyncio.to_thread(extract_frames, video_path, meta, Path(tmp), cues)
+                        frames = await asyncio.to_thread(extract_frames, video_path, meta, Path(tmp), cues) if cues else []
                     except Exception as exc:  # screenshots are optional
                         log.warning("Screenshot extraction failed; continuing without: %s", exc)
                 if frames:

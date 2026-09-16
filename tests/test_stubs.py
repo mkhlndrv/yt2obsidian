@@ -267,7 +267,7 @@ async def main():
     print("choose_folder OK")
     async def fake_choose(m, note): return "Knowledge/Testing"
     bot.choose_folder = fake_choose
-    def fake_transcribe(p, video_id): seen["audio_existed"] = p.exists(); seen["path"] = p; seen["vid"] = video_id; return [(0.0, 1.0, "one two three")]
+    def fake_transcribe(p, video_id, required=True): seen["audio_existed"] = p.exists(); seen["path"] = p; seen["vid"] = video_id; seen["required"] = required; return [(0.0, 1.0, "one two three")]
     bot.download_audio = fake_download; bot.transcribe_audio = fake_transcribe
     bot.INCLUDE_TRANSCRIPT = False
     bot.INCLUDE_FRAMES = False
@@ -298,6 +298,7 @@ async def main():
 
     # screenshots enabled but Claude picks no moment: no video download, no frames
     bot.INCLUDE_FRAMES = True
+    bot.FRAMES_SCAN_MAX_MINUTES = 0  # long-video behaviour first: screenshots only where Claude points
     calls = []
     def fake_video(vid, out_dir): calls.append("video"); p = out_dir / "video.mp4"; p.write_bytes(b"v"); return p
     def fake_frames(vp, m, out_dir, cues): assert vp.exists(); calls.append(("frames", cues)); return [(5.0, "why", b"img")]
@@ -321,8 +322,28 @@ async def main():
     await bot.process_item(SRC, 7, ctx)
     assert status().startswith("Done") and "Screenshots" not in status(), status()
     assert (NOTES / "A Talk (5).md").exists()
+    # short video (the fixture is 65 s): the visual scan adds its moments even when Claude picks none ...
+    bot.FRAMES_SCAN_MAX_MINUTES = 5
+    bot.extract_frames = fake_frames; bot.find_screen_cues = no_cues; calls.clear()
+    bot.scan_video = lambda vp: [(0.5, "opening frame"), (7.0, "the picture changed")]
+    bot._anthropic_client, captured = fake_client(fake_message(note_text))
+    await bot.process_item(SRC, 7, ctx)
+    assert calls == ["video", ("frames", [(0.5, "opening frame"), (7.0, "the picture changed")])] and "\nScreenshots — 1\n" in status(), (calls, status())
+    # ... merges with Claude's (a scan moment within a second of his is dropped) ...
+    bot.find_screen_cues = one_cue; calls.clear()
+    bot.scan_video = lambda vp: [(0.5, "opening frame"), (12.5, "the picture changed"), (20.0, "the picture changed")]
+    bot._anthropic_client, captured = fake_client(fake_message(note_text))
+    await bot.process_item(SRC, 7, ctx)
+    assert calls == ["video", ("frames", [(0.5, "opening frame"), (12.0, "the code"), (20.0, "the picture changed")])], calls
+    # ... and a failed scan keeps Claude's moments
+    def broken_scan(vp): raise bot.PipelineError("ffmpeg could not read the video")
+    bot.scan_video = broken_scan; calls.clear()
+    bot._anthropic_client, captured = fake_client(fake_message(note_text))
+    await bot.process_item(SRC, 7, ctx)
+    assert calls == ["video", ("frames", [(12.0, "the code")])] and "\nScreenshots — 1\n" in status(), (calls, status())
+    bot.FRAMES_SCAN_MAX_MINUTES = 0
     bot.INCLUDE_FRAMES = False
-    print("frames flow OK (Claude-gated, image sent, extraction failure tolerated)")
+    print("frames flow OK (Claude-gated, image sent, extraction failure tolerated, short-video scan merged)")
 
     # SEND_NOTE_FILE=false: the note is saved and confirmed, no file is attached
     n_docs = len(docs)
@@ -418,7 +439,7 @@ async def main():
                       images=[img_dir / "photo_00.jpg"])
     bot.fetch_x = lambda tid, out_dir: x_item
     transcribed = []
-    bot.transcribe_audio = lambda p, vid: transcribed.append(p) or []
+    bot.transcribe_audio = lambda p, vid, required=True: transcribed.append(p) or []
     bot._anthropic_client, captured = fake_client(fake_message(note_text))
     await bot.process_item(bot.Source("x", "30", "https://x.com/i/status/30"), 7, ctx)
     assert status() == "Done\n@alice: Third\n\nDownloaded\nImages — 1\nFiled under Knowledge/Testing\nNote saved: @alice Third", status()
@@ -429,6 +450,35 @@ async def main():
     assert "POST TEXT" in body and "@alice (Alice A): Third" in body and "type: post-note" in body and "Platform: X" in body and "(no audio)" in body, body[:400]
     bot.transcribe_audio = fake_transcribe
     print("x post flow OK")
+
+    # a tweet's silent clip (GIF-style): no transcription attempt, the visual scan supplies the frames
+    vid_dir = pathlib.Path(tempfile.mkdtemp()); (vid_dir / "video.mp4").write_bytes(b"v")
+    x_video = bot.Item(video_id="31", url="https://x.com/alice/status/31", title="@alice: Clip", channel="Alice A", published="2023-11-14",
+                       duration_seconds=9, description="Clip", kind="x", handle="alice", text="This tweet:\n@alice (Alice A): Clip",
+                       audio_path=vid_dir / "video.mp4", video_path=vid_dir / "video.mp4")
+    bot.fetch_x = lambda tid, out_dir: x_video
+    bot.has_audio_stream = lambda p: False
+    def no_transcribe(p, vid, required=True): raise AssertionError("a silent clip must not be transcribed")
+    bot.transcribe_audio = no_transcribe
+    bot.INCLUDE_FRAMES = True; bot.FRAMES_SCAN_MAX_MINUTES = 5
+    bot.scan_video = lambda vp: [(0.0, "opening frame"), (4.0, "the picture changed")]
+    bot.extract_frames = lambda vp, m, out_dir, cues: [(s, w, b"\xff\xd8f") for s, w in cues]
+    bot._anthropic_client, captured = fake_client(fake_message(note_text))
+    await bot.process_item(bot.Source("x", "31", "https://x.com/i/status/31"), 7, ctx)
+    assert status() == "Done\n@alice: Clip (0:09)\n\nDownloaded\nNo audio track\nScreenshots — 2\nFiled under Knowledge/Testing\nNote saved: @alice Clip", status()
+    content = captured["messages"][0]["content"]
+    assert [c["type"] for c in content] == ["text", "text", "image", "text", "image", "text"], [c["type"] for c in content]
+    assert content[1]["text"] == "Frame at [0:00](https://x.com/alice/status/31) (opening frame):", content[1]["text"]
+    # a clip with music but no speech: an empty transcript rather than an error, scan frames as before
+    bot.has_audio_stream = lambda p: True
+    def no_speech(p, vid, required=True): assert required is False, "a post's clip must not require speech"; return []
+    bot.transcribe_audio = no_speech
+    bot._anthropic_client, captured = fake_client(fake_message(note_text))
+    await bot.process_item(bot.Source("x", "31", "https://x.com/i/status/31"), 7, ctx)
+    assert "\nDownloaded\nNo speech found\nScreenshots — 2\n" in status() and status().startswith("Done"), status()
+    assert "(no audio)" in captured["messages"][0]["content"][-1]["text"] or "TRANSCRIPT" in captured["messages"][0]["content"][-1]["text"]
+    bot.INCLUDE_FRAMES = False; bot.FRAMES_SCAN_MAX_MINUTES = 0
+    print("silent clip flow OK")
     shutil.rmtree(v)
     print("send_document failure path OK")
     print("ALL STUB TESTS PASSED")

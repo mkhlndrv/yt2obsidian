@@ -165,6 +165,33 @@ bot.FRAMES_MAX = 30
 assert bot.pick_frames([]) == []
 print("pick_frames OK")
 
+# merge_cues: scan moments join Claude's in time order, unless within a second of one of Claude's
+assert bot.merge_cues([(12.0, "the code")], [(0.5, "opening frame"), (12.5, "the picture changed"), (30.0, "the picture changed")]) == [(0.5, "opening frame"), (12.0, "the code"), (30.0, "the picture changed")]
+assert bot.merge_cues([], [(0.0, "opening frame")]) == [(0.0, "opening frame")] and bot.merge_cues([(3.0, "x")], []) == [(3.0, "x")]
+import dataclasses, shutil, subprocess
+short = bot.Item(video_id="s", url="u", title="t", channel="c", published="p", duration_seconds=58, description="")
+assert bot.scan_wanted(short) and not bot.scan_wanted(dataclasses.replace(short, duration_seconds=0)) and not bot.scan_wanted(dataclasses.replace(short, duration_seconds=301))
+print("merge_cues / scan_wanted OK")
+# scan_video on a synthetic clip (2 s black, 2 s red, 2 s blue): the first non-black frame, then the cut to blue
+if shutil.which("ffmpeg"):
+    clip = pathlib.Path(tempfile.mkdtemp()) / "clip.mp4"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=black:s=160x90:d=2:r=10",
+                    "-f", "lavfi", "-i", "color=c=red:s=160x90:d=2:r=10", "-f", "lavfi", "-i", "color=c=blue:s=160x90:d=2:r=10",
+                    "-filter_complex", "[0][1][2]concat=n=3:v=1:a=0", "-pix_fmt", "yuv420p", str(clip)], check=True)
+    assert bot.scan_video(clip) == [(2.0, "opening frame"), (4.0, "the picture changed")], bot.scan_video(clip)
+    bot.FRAMES_SCAN_MAX = 1
+    assert bot.scan_video(clip) == [(2.0, "opening frame")]                    # thinned evenly to the budget
+    bot.FRAMES_SCAN_MAX = 12
+    assert bot.has_audio_stream(clip) is False                                 # a silent clip
+    with_audio = clip.with_name("with_audio.mp4")
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(clip), "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+                    "-shortest", "-c:v", "copy", "-c:a", "aac", str(with_audio)], check=True)
+    assert bot.has_audio_stream(with_audio) is True
+    assert bot.has_audio_stream(clip.with_name("missing.mp4")) is True         # unsure -> let transcription report it
+    print("scan_video / has_audio_stream OK")
+else:
+    print("scan_video / has_audio_stream SKIPPED (no ffmpeg on this machine)")
+
 note_with_t = bot.append_transcript("---\na: b\n---\n# N\n- x\n", "[0:00](u) one two.\n\n[0:30](v) three.")
 assert note_with_t.endswith("# N\n- x\n\n## Transcript\n> [!quote]- Full transcript (speech recognition, may contain errors)\n"
                             "> [0:00](u) one two.\n>\n> [0:30](v) three.\n"), repr(note_with_t)
