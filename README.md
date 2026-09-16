@@ -85,14 +85,18 @@ Each link goes through six steps, all in `bot.py`:
    `Knowledge/Crypto trading`, `Knowledge/Programming`). Existing project folders are used
    only when a note is clearly about that project; new folders never go anywhere else. The
    pick is normalised in code, so a bad answer lands in `Knowledge/Inbox` rather than
-   somewhere odd.
+   somewhere odd. Each topic folder gets a **topic page** named after it (created with the
+   folder's first note) that lists its notes live through an Obsidian `query` block and links
+   up to `Home`; every filed note gets a `topic` property and a Related entry pointing at that
+   page. That is what keeps the graph connected: Home → topics → notes, with no plugins.
 6. **Deliver.** The note is written under that folder, optionally pushed anywhere by a shell
    command (for example `aws s3 cp` into a bucket your vault syncs from, keeping the folder),
    and optionally attached to the chat as a file.
 
 Everything Claude-facing is a constant at the top of `bot.py`: `NOTE_TEMPLATE` and
 `POST_TEMPLATE`, `SYSTEM_PROMPT`, `USER_PROMPT` (the note), `CUE_PROMPT` (screenshot
-selection), and `FILE_PROMPT` (filing).
+selection), `FILE_PROMPT` (filing), and `TOPIC_NOTE_TEMPLATE` (topic pages). A `Home` note
+with a `tag:#topic` query block lists every topic page automatically.
 
 ## Layout
 

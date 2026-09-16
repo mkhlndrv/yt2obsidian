@@ -190,6 +190,22 @@ assert p1.read_text() == "note1\n"
 p4 = bot.write_note("note4\n", meta, "Knowledge/Crypto trading")
 assert p4 == v / "Knowledge" / "Crypto trading" / "He said hi a talk.md" and p4.read_text() == "note4\n"
 assert bot.list_vault_folders() == ["Knowledge", "Knowledge/Crypto trading"]
+assert sorted(bot.list_vault_paths())[:2] == ["He said hi a talk (2).md", "He said hi a talk (3).md"]
+
+# topic pages and topic links
+assert bot.topic_of("Knowledge/Crypto trading") == "Crypto trading" and bot.topic_of("Projects/X") is None and bot.topic_of("Knowledge") is None
+tp = bot.ensure_topic_note("Knowledge/Crypto trading")
+assert tp == v / "Knowledge" / "Crypto trading" / "Crypto trading.md" and tp.read_text().startswith("---\ntags:\n  - topic\nup: \"[[Home]]\"\n---\n\n# Crypto trading\n")
+assert 'path:"Knowledge/Crypto trading/" -tag:#topic' in tp.read_text()
+assert bot.ensure_topic_note("Knowledge/Crypto trading") is None                 # already there
+assert bot.ensure_topic_note("Projects/Football scouting") is None               # projects get no topic page
+linked = bot.link_note_to_topic('---\ntitle: "x"\n---\n# X\n\n## Related\n- [[Other]]\n\n## Source\n- v\n', "Crypto trading")
+assert linked == '---\ntitle: "x"\ntopic: "[[Crypto trading]]"\n---\n# X\n\n## Related\n- [[Crypto trading]]\n- [[Other]]\n\n## Source\n- v\n', linked
+assert bot.link_note_to_topic(linked, "Crypto trading") == linked                 # idempotent
+no_related = bot.link_note_to_topic("---\na: b\n---\n# X\n- x\n\n## Transcript\n> t\n", "Programming")
+assert no_related == '---\na: b\ntopic: "[[Programming]]"\n---\n# X\n- x\n\n## Related\n- [[Programming]]\n\n## Transcript\n> t\n', no_related
+assert bot.link_note_to_topic("# plain\n", "T") == "# plain\n\n## Related\n- [[T]]\n"
+print("topic pages / links OK")
 # AFTER_NOTE_COMMAND placeholders: {path}, {relpath}, {folder}
 out = v / "hook.txt"
 bot.AFTER_NOTE_COMMAND = f"printf '%s|%s|%s' {{path}} {{relpath}} {{folder}} > {shlex.quote(str(out))}"

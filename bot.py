@@ -307,6 +307,27 @@ project or that part of the owner's life; never use the vault root or "Home".
 - Reply with JSON only: {{"folder": "{root}/Topic", "why": "under 12 words"}}
 """
 
+# Created once per topic folder, named after the folder (e.g. Knowledge/Programming/Programming.md).
+# Every note filed into the folder links to it, so the graph connects Home -> topic -> notes, and
+# the ```query block keeps the page's list of notes live without anyone maintaining it.
+# The bot fills {topic} and {folder}.
+TOPIC_NOTE_TEMPLATE = """\
+---
+tags:
+  - topic
+up: "[[Home]]"
+---
+
+# {topic}
+
+Everything saved under this topic. The list below is live; every note filed here links back to
+this page.
+
+```query
+path:"{folder}/" -tag:#topic
+```
+"""
+
 # =============================================================================
 # Configuration (from .env / environment)
 # =============================================================================
@@ -1420,20 +1441,68 @@ def folders_from_listing(lines: list[str]) -> list[str]:
     return sorted(folders)
 
 
-def list_vault_folders() -> list[str]:
-    """Blocking. The folders that exist in the vault, from VAULT_LIST_COMMAND or the local vault folder."""
+def list_vault_paths() -> list[str]:
+    """Blocking. The vault's file paths, from VAULT_LIST_COMMAND or the local vault folder."""
     if VAULT_LIST_COMMAND:
         try:
             result = subprocess.run(VAULT_LIST_COMMAND, shell=True, capture_output=True, text=True, timeout=120)
             if result.returncode == 0:
-                return folders_from_listing(result.stdout.splitlines())
+                paths = []
+                for line in result.stdout.splitlines():
+                    match = _S3_LISTING_RE.match(line.strip())
+                    paths.append(match.group(1) if match else line.strip())
+                return [p for p in paths if p]
             log.warning("VAULT_LIST_COMMAND failed (exit %d): %s", result.returncode, result.stderr.strip()[:200])
         except (OSError, subprocess.TimeoutExpired) as exc:
             log.warning("VAULT_LIST_COMMAND failed: %s", exc)
     if VAULT_PATH.is_dir():
-        paths = [str(p.relative_to(VAULT_PATH)) for p in VAULT_PATH.rglob("*") if p.is_file()]
-        return folders_from_listing(paths)
+        return [str(p.relative_to(VAULT_PATH)) for p in VAULT_PATH.rglob("*") if p.is_file()]
     return []
+
+
+def list_vault_folders() -> list[str]:
+    """Blocking. The folders that exist in the vault."""
+    return folders_from_listing(list_vault_paths())
+
+
+def topic_of(folder: str) -> str | None:
+    """The topic name for a Knowledge folder ("Knowledge/Programming" -> "Programming"), else None."""
+    parts = folder.split("/")
+    return parts[1] if len(parts) == 2 and parts[0] == KNOWLEDGE_ROOT else None
+
+
+def link_note_to_topic(note: str, topic: str) -> str:
+    """Add a `topic` property and a first Related entry pointing at the topic page, so the graph connects."""
+    link = f"[[{topic}]]"
+    if note.startswith("---"):
+        end = note.find("\n---", 3)
+        if end != -1 and "\ntopic:" not in note[:end]:
+            note = note[:end] + f'\ntopic: "{link}"' + note[end:]
+    if "\n## Related\n" in note:
+        head, _sep, rest = note.partition("\n## Related\n")
+        if link not in rest.split("\n## ", 1)[0]:
+            note = head + "\n## Related\n" + f"- {link}\n" + rest
+        return note
+    block = f"\n## Related\n- {link}\n"
+    cut = note.find("\n## Transcript")
+    return (note[:cut].rstrip() + "\n" + block + note[cut:]) if cut != -1 else note.rstrip() + "\n" + block
+
+
+def ensure_topic_note(folder: str) -> Path | None:
+    """Blocking. Create the topic page for a Knowledge folder if the vault has none yet; returns its path if created."""
+    topic = topic_of(folder)
+    if topic is None:
+        return None
+    relpath = f"{folder}/{topic}.md"
+    if relpath in set(list_vault_paths()) or (VAULT_PATH / relpath).exists():
+        return None
+    path = VAULT_PATH / relpath
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(TOPIC_NOTE_TEMPLATE.replace("{topic}", topic).replace("{folder}", folder), encoding="utf-8")
+    log.info("Created topic page %s", relpath)
+    if AFTER_NOTE_COMMAND:
+        run_after_note_command(path)
+    return path
 
 
 def normalize_folder(folder: str, existing: list[str]) -> str:
@@ -1699,6 +1768,13 @@ async def process_item(source: Source, chat_id: int, context: ContextTypes.DEFAU
 
         await status.pending_step("Filing")
         folder = await choose_folder(meta, note)
+        topic = topic_of(folder)
+        if topic:
+            note = link_note_to_topic(note, topic)
+            try:
+                await asyncio.to_thread(ensure_topic_note, folder)
+            except PipelineError as exc:  # the topic page's upload failed; the note itself still goes through
+                log.warning("Topic page for %s not uploaded: %s", folder, exc)
         path = await asyncio.to_thread(write_note, note, meta, folder)
         await status.step(f"Filed under {folder}")
 

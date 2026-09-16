@@ -266,8 +266,10 @@ async def main():
     assert len(sent) == n_before + 1, "exactly one status message per job"
     assert status() == "Done\nA Talk (1:05)\n\nDownloaded\nTranscribed — 3 words\nFiled under Knowledge/Testing\nNote saved: A Talk", status()
     NOTES = v / "Knowledge" / "Testing"
-    assert (NOTES / "A Talk.md").read_text() == note_text + "\n"
-    assert docs == [(7, (note_text + "\n").encode(), "A Talk.md", "A Talk")], docs
+    linked_note = bot.link_note_to_topic(note_text + "\n", "Testing")
+    assert (NOTES / "A Talk.md").read_text() == linked_note and 'topic: "[[Testing]]"' in linked_note
+    assert (NOTES / "Testing.md").exists(), "topic page created with the first note"
+    assert docs == [(7, linked_note.encode(), "A Talk.md", "A Talk")], docs
     assert seen["audio_existed"] and not seen["path"].exists(), "temp audio not deleted"
     assert seen["vid"] == "dQw4w9WgXcQ"
     print("process_video full flow OK (temp audio deleted, note written, file sent)")
@@ -278,6 +280,7 @@ async def main():
     await bot.process_item(SRC, 7, ctx)
     saved = (NOTES / "A Talk (2).md").read_text()
     assert saved.endswith("## Transcript\n> [!quote]- Full transcript (speech recognition, may contain errors)\n> [0:00](https://youtu.be/dQw4w9WgXcQ?t=0) one two three\n"), saved
+    assert "\n## Related\n- [[Testing]]\n\n## Transcript" in saved, saved
     assert docs[-1][1] == saved.encode()
     bot.INCLUDE_TRANSCRIPT = False
     print("transcript appended OK")
@@ -324,7 +327,7 @@ async def main():
     bot.AFTER_NOTE_COMMAND = f"cat {{path}} > {shlex.quote(str(marker))}"
     bot._anthropic_client, _ = fake_client(fake_message(note_text))
     await bot.process_item(SRC, 7, ctx)
-    assert marker.read_text() == note_text + "\n", marker.read_text()[:80]
+    assert marker.read_text() == bot.link_note_to_topic(note_text + "\n", "Testing"), marker.read_text()[:80]
     assert "\nNote added to vault: Knowledge/Testing/A Talk" in status() and "failed" not in status(), status()
     bot.AFTER_NOTE_COMMAND = "exit 3"
     bot._anthropic_client, _ = fake_client(fake_message(note_text))
@@ -401,7 +404,7 @@ async def main():
     bot._anthropic_client, captured = fake_client(fake_message(note_text))
     await bot.process_item(bot.Source("x", "30", "https://x.com/i/status/30"), 7, ctx)
     assert status() == "Done\n@alice: Third\n\nDownloaded\nImages — 1\nFiled under Knowledge/Testing\nNote saved: @alice Third", status()
-    assert transcribed == [] and (NOTES / "@alice Third.md").read_text() == note_text + "\n"
+    assert transcribed == [] and (NOTES / "@alice Third.md").read_text() == bot.link_note_to_topic(note_text + "\n", "Testing")
     content = captured["messages"][0]["content"]
     assert [c["type"] for c in content] == ["text", "text", "image", "text"] and content[1]["text"] == "Image 1 (image attached to the post):", content[:2]
     body = content[-1]["text"]
