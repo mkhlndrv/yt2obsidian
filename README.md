@@ -83,9 +83,10 @@ Each link goes through six steps, all in `bot.py`:
 5. **File.** Claude sees the folders that already exist in the vault and picks the one the
    note belongs in, or names a new topic folder under `Knowledge/` (for example
    `Knowledge/Crypto trading`, `Knowledge/Programming`). Existing project folders are used
-   only when a note is clearly about that project; new folders never go anywhere else. The
-   pick is normalised in code, so a bad answer lands in `Knowledge/Inbox` rather than
-   somewhere odd. Each topic folder gets a **topic page** named after it (created with the
+   only when a note is clearly about that project; new folders never go anywhere else. A
+   catch-all answer ("Inbox", "Misc") is asked again once, and the pick is normalised in
+   code, so a bad answer lands in `Knowledge/Inbox` rather than somewhere odd. Each topic
+   folder gets a **topic page** named after it (created with the
    folder's first note) that lists its notes live through an Obsidian `query` block and links
    up to `Home`; every filed note gets a `topic` property and a Related entry pointing at that
    page. That is what keeps the graph connected: Home → topics → notes, with no plugins.

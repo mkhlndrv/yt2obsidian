@@ -304,6 +304,8 @@ trading", "{root}/Programming", "{root}/Personal finance", "{root}/Health". Broa
 narrow: a vault should end up with dozens of topics, not hundreds.
 - Never file under "Projects/" or "Life/" unless the note is explicitly about that existing \
 project or that part of the owner's life; never use the vault root or "Home".
+- Catch-alls are never an answer: no "Inbox", "Misc", "General", "Unsorted" or the like. When \
+nothing existing fits, creating the topic folder is the right answer, not a failure.
 - Reply with JSON only: {{"folder": "{root}/Topic", "why": "under 12 words"}}
 """
 
@@ -1527,25 +1529,50 @@ def normalize_folder(folder: str, existing: list[str]) -> str:
     return f"{KNOWLEDGE_ROOT}/{leaf}"
 
 
+CATCH_ALL_FOLDERS = {
+    "inbox", "misc", "miscellaneous", "general", "unsorted", "uncategorized", "uncategorised",
+    "other", "others", "random", "various", "unfiled",
+}
+
+
+def is_catch_all(folder: str) -> bool:
+    """True for a "put it anywhere" answer (Knowledge/Inbox, Misc, ...), which filing should not settle for."""
+    leaf = folder.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].strip().lower()
+    return leaf in CATCH_ALL_FOLDERS
+
+
 async def choose_folder(meta: Item, note: str) -> str:
     """Ask Claude where the note belongs, given the vault's existing folders. Falls back to KNOWLEDGE_ROOT/Inbox."""
     existing = await asyncio.to_thread(list_vault_folders)
     head = "\n".join(note.split("\n## Notes", 1)[0].split("\n## Content", 1)[0].splitlines()[:60])
     prompt = f"NOTE ({meta.platform}):\n{head}\n\nEXISTING FOLDERS:\n" + ("\n".join(existing) or "(none yet)")
     system = FILE_PROMPT.format(root=KNOWLEDGE_ROOT)
-    try:
+    inbox = f"{KNOWLEDGE_ROOT}/Inbox"
+
+    async def ask(user_prompt: str) -> FolderChoice:
         if NOTE_BACKEND == "claude-code":
-            text, _usage = await claude_code_complete(system, prompt, CUE_MODEL)
-            choice = FolderChoice.model_validate_json(_extract_json(text))
-        else:
-            response = await get_anthropic().messages.parse(
-                model=CUE_MODEL, max_tokens=300, system=system, output_config={"effort": "low"},
-                messages=[{"role": "user", "content": prompt}], output_format=FolderChoice,
+            text, _usage = await claude_code_complete(system, user_prompt, CUE_MODEL)
+            return FolderChoice.model_validate_json(_extract_json(text))
+        response = await get_anthropic().messages.parse(
+            model=CUE_MODEL, max_tokens=300, system=system, output_config={"effort": "low"},
+            messages=[{"role": "user", "content": user_prompt}], output_format=FolderChoice,
+        )
+        return response.parsed_output or FolderChoice(folder="")
+
+    try:
+        choice = await ask(prompt)
+        if is_catch_all(choice.folder):  # the model gives up on new subjects too easily; one pointed retry
+            log.info("Filing answered %r; asking for a subject instead", choice.folder)
+            choice = await ask(
+                f"{prompt}\n\nYour previous answer, \"{choice.folder}\", is a catch-all. Name the note's "
+                f"subject instead: an existing folder, or a new \"{KNOWLEDGE_ROOT}/<Topic>\"."
             )
-            choice = response.parsed_output or FolderChoice(folder="")
     except (PipelineError, anthropic.APIError, ValueError) as exc:  # pydantic's ValidationError is a ValueError
-        log.warning("Filing failed; using %s/Inbox: %s", KNOWLEDGE_ROOT, exc)
-        return f"{KNOWLEDGE_ROOT}/Inbox"
+        log.warning("Filing failed; using %s: %s", inbox, exc)
+        return inbox
+    if is_catch_all(choice.folder):
+        log.info("Filing gave a catch-all twice; using %s", inbox)
+        return inbox
     folder = normalize_folder(choice.folder, existing)
     log.info("Filed under %s (%s)", folder, choice.why)
     return folder

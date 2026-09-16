@@ -106,6 +106,8 @@ assert N("Crypto trading") == "Knowledge/Crypto trading" and N("Economics") == "
 assert N("Knowledge/Programming/Rust") == "Knowledge/Programming"          # two levels max
 assert N("Knowledge") == "Knowledge/Inbox" and N("") == "Knowledge/Inbox" and N("Home") == "Knowledge/Inbox"
 assert N('Knowledge/Bad: "name"/x') == "Knowledge/Bad name"
+assert bot.is_catch_all("Knowledge/Inbox") and bot.is_catch_all("misc") and bot.is_catch_all("Knowledge/Unsorted/")
+assert not bot.is_catch_all("Knowledge/Space") and not bot.is_catch_all("Knowledge/Inbox management")
 print("folders_from_listing / normalize_folder OK")
 
 imgs = [pathlib.Path(tempfile.mkdtemp()) / "a.jpg"]; imgs[0].write_bytes(b"img")

@@ -15,15 +15,17 @@ class FakeStream:
     async def get_final_message(self): return self.msg
 
 def fake_client(msg=None, exc=None, parsed=None):
-    captured = {}
+    """`parsed` may be a list: one parsed result per parse() call, in order."""
+    captured = {"calls": 0}
+    queue = list(parsed) if isinstance(parsed, list) else None
     def stream(**kw):
         captured.update(kw)
         if exc: raise exc
         return FakeStream(msg)
     async def parse(**kw):
-        captured.update(kw)
+        captured.update(kw); captured["calls"] += 1
         if exc: raise exc
-        return types.SimpleNamespace(parsed_output=parsed)
+        return types.SimpleNamespace(parsed_output=queue.pop(0) if queue else parsed)
     return types.SimpleNamespace(messages=types.SimpleNamespace(stream=stream, parse=parse)), captured
 
 def fake_message(text, stop_reason="end_turn"):
@@ -252,6 +254,15 @@ async def main():
     assert await bot.choose_folder(meta, note_text) == "Knowledge/Brand new"
     bot._anthropic_client, _ = fake_client(exc=anthropic.APIConnectionError(request=req))
     assert await bot.choose_folder(meta, note_text) == "Knowledge/Inbox"
+    # a catch-all answer gets one pointed retry; a catch-all twice lands in Inbox without inventing a "Misc" topic
+    bot._anthropic_client, captured = fake_client(parsed=[bot.FolderChoice(folder="Knowledge/Inbox", why="no fit"),
+                                                          bot.FolderChoice(folder="Knowledge/Astronomy")])
+    assert await bot.choose_folder(meta, note_text) == "Knowledge/Astronomy"
+    assert captured["calls"] == 2 and 'Your previous answer, "Knowledge/Inbox", is a catch-all' in captured["messages"][0]["content"]
+    bot._anthropic_client, captured = fake_client(parsed=[bot.FolderChoice(folder="Misc"), bot.FolderChoice(folder="Knowledge/General")])
+    assert await bot.choose_folder(meta, note_text) == "Knowledge/Inbox" and captured["calls"] == 2
+    bot._anthropic_client, captured = fake_client(parsed=bot.FolderChoice(folder="Knowledge/Space"))
+    assert await bot.choose_folder(meta, note_text) == "Knowledge/Space" and captured["calls"] == 1
     shutil.rmtree(v / "Knowledge")
     print("choose_folder OK")
     async def fake_choose(m, note): return "Knowledge/Testing"
