@@ -469,6 +469,7 @@ class Item:
     audio_path: Path | None = None  # local media to transcribe (temp; reels and tweet videos)
     video_path: Path | None = None  # local video for screenshots (temp; reels and tweet videos)
     images: list[Path] = field(default_factory=list)  # images attached to the post (temp)
+    image_labels: dict[str, str] = field(default_factory=dict)  # file name -> what the image is, when not the post's own
 
     @property
     def duration_str(self) -> str:
@@ -832,15 +833,31 @@ def fetch_x(tweet_id: str, out_dir: Path) -> Item:
 
     media = tweet.get("media") or {}
     images: list[Path] = []
-    for i, photo in enumerate(media.get("photos") or []):
-        photo_url = photo.get("url")
-        if photo_url:
-            suffix = Path(photo_url.split("?")[0]).suffix or ".jpg"
-            images.append(_download_file(photo_url, out_dir / f"photo_{i:02d}{suffix}"))
+    labels: dict[str, str] = {}
+
+    def grab_photos(t: dict, prefix: str, label: str | None = None) -> None:
+        for i, photo in enumerate((t.get("media") or {}).get("photos") or []):
+            photo_url = photo.get("url")
+            if photo_url and len(images) < FRAMES_MAX:
+                suffix = Path(photo_url.split("?")[0]).suffix or ".jpg"
+                path = _download_file(photo_url, out_dir / f"{prefix}_{i:02d}{suffix}")
+                images.append(path)
+                if label:
+                    labels[path.name] = label
+
+    def handle_of(t: dict) -> str:
+        return str((t.get("author") or {}).get("screen_name") or "?")
+
+    grab_photos(tweet, "photo")
     video = None
     videos = media.get("videos") or []
     if videos and videos[0].get("url"):
         video = _download_file(videos[0]["url"], out_dir / "video.mp4")
+    # The quoted tweet's and the thread's photos are part of what a reader sees, so they ride along, labelled.
+    if tweet.get("quote"):
+        grab_photos(tweet["quote"], "quoted", f"image attached to the quoted tweet by @{handle_of(tweet['quote'])}")
+    for j, parent in enumerate(parents):
+        grab_photos(parent, f"thread_{j:02d}", f"image attached to an earlier tweet in the thread by @{handle_of(parent)}")
 
     author = tweet.get("author") or {}
     handle = str(author.get("screen_name") or "")
@@ -860,6 +877,7 @@ def fetch_x(tweet_id: str, out_dir: Path) -> Item:
         audio_path=video,
         video_path=video,
         images=images,
+        image_labels=labels,
     )
     log.info("Fetched tweet %s by @%s: %d image(s), %s, %d earlier in thread", tweet_id, handle, len(images), "video" if video else "no video", len(parents))
     return item
@@ -1306,9 +1324,10 @@ def _frame_label(meta: Item, seconds: float, why: str) -> str:
     return f"Frame at {timestamp_link(meta, seconds)} ({why}):"
 
 
-def images_as_frames(images: list[Path]) -> list[Frame]:
+def images_as_frames(images: list[Path], labels: dict[str, str] | None = None) -> list[Frame]:
     """Attached images ride along with the screenshots; negative 'seconds' marks them as images."""
-    return [(-(i + 1), "image attached to the post", path.read_bytes()) for i, path in enumerate(images)]
+    labels = labels or {}
+    return [(-(i + 1), labels.get(path.name, "image attached to the post"), path.read_bytes()) for i, path in enumerate(images)]
 
 
 async def generate_note(meta: Item, transcript: str, frames: list[Frame] = ()) -> str:
@@ -1788,7 +1807,7 @@ async def process_item(source: Source, chat_id: int, context: ContextTypes.DEFAU
                 else:
                     await status.drop_pending()
             if meta.images:
-                frames += images_as_frames(meta.images)
+                frames += images_as_frames(meta.images, meta.image_labels)
                 await status.step(f"Images — {len(meta.images)}")
         # Leaving the `with` block deletes the temp directory with the audio, video, images, and frames.
 

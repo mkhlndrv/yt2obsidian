@@ -364,9 +364,11 @@ async def main():
                          "author": {"name": "Alice A", "screen_name": "alice"}, "replying_to_status": "20",
                          "media": {"photos": [{"url": "https://pbs.twimg.com/media/abc.jpg?name=orig"}],
                                    "videos": [{"url": "https://video.twimg.com/v.mp4", "duration": 12.5}]},
-                         "quote": {"text": "quoted words", "author": {"name": "Q", "screen_name": "quoter"}}}},
+                         "quote": {"text": "quoted words", "author": {"name": "Q", "screen_name": "quoter"},
+                                   "media": {"photos": [{"url": "https://pbs.twimg.com/media/q.jpg"}]}}}},
         "20": {"tweet": {"id": "20", "text": "Second", "author": {"name": "Alice A", "screen_name": "alice"}, "replying_to_status": "10"}},
-        "10": {"tweet": {"id": "10", "text": "First", "author": {"name": "Alice A", "screen_name": "alice"}, "replying_to_status": None}},
+        "10": {"tweet": {"id": "10", "text": "First", "author": {"name": "Alice A", "screen_name": "alice"}, "replying_to_status": None,
+                         "media": {"photos": [{"url": "https://pbs.twimg.com/media/first.png"}]}}},
     }
     bot._http_get_json = lambda url: payloads[url.rsplit("/", 1)[1]]
     downloaded = []
@@ -376,7 +378,12 @@ async def main():
     assert x.kind == "x" and x.handle == "alice" and x.channel == "Alice A" and x.title == "@alice: Third: the conclusion", x
     assert x.text.startswith("Earlier tweets in this thread, oldest first:\n@alice (Alice A): First\n\n@alice (Alice A): Second"), x.text
     assert "This tweet:\n@alice (Alice A): Third: the conclusion" in x.text and x.text.endswith("Quoted tweet:\n@quoter (Q): quoted words"), x.text
-    assert downloaded == ["photo_00.jpg", "video.mp4"] and len(x.images) == 1 and x.video_path.name == "video.mp4" and x.audio_path == x.video_path
+    # the tweet's own photos first, then the quoted tweet's and the thread's (oldest first), each labelled with its origin
+    assert downloaded == ["photo_00.jpg", "video.mp4", "quoted_00.jpg", "thread_00_00.png"] and [p.name for p in x.images] == ["photo_00.jpg", "quoted_00.jpg", "thread_00_00.png"], downloaded
+    assert x.image_labels == {"quoted_00.jpg": "image attached to the quoted tweet by @quoter",
+                              "thread_00_00.png": "image attached to an earlier tweet in the thread by @alice"}, x.image_labels
+    assert [f[:2] for f in bot.images_as_frames(x.images, x.image_labels)] == [(-1, "image attached to the post"), (-2, "image attached to the quoted tweet by @quoter"), (-3, "image attached to an earlier tweet in the thread by @alice")]
+    assert x.video_path.name == "video.mp4" and x.audio_path == x.video_path
     assert x.duration_seconds == 12 and x.published == "2023-11-14" and x.url == "https://x.com/alice/status/30", (x.duration_seconds, x.published)
     bot._http_get_json = lambda url: {"message": "NOT_FOUND"}
     try:
