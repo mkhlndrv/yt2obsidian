@@ -66,12 +66,13 @@ NOTE_TEMPLATE = """\
 title: "{title}"
 source: {url}
 channel: "{channel}"
+platform: {platform}
 published: {published}
 date: {date}
 duration: "{duration}"
 type: video-note
 tags:
-  - youtube
+  - {platform}
   - {topic-tag}
   - {topic-tag}
   - {topic-tag}
@@ -109,21 +110,64 @@ tags:
 - Channel: [[{channel}]]
 """
 
+# Short-form template for Instagram posts and reels and for tweets. Same placeholder rules.
+POST_TEMPLATE = """\
+---
+title: "{title}"
+source: {url}
+author: "{channel}"
+platform: {platform}
+published: {published}
+date: {date}
+type: post-note
+tags:
+  - {platform}
+  - {topic-tag}
+  - {topic-tag}
+---
+
+# {title}
+
+> [!summary]
+> {1-3 sentences: what this post says and why it is worth keeping.}
+
+## Content
+> {The post's own words, lightly cleaned: the tweet text or the caption, with the earlier tweets of a thread or a quoted tweet where they matter. For a video, the statements that carry the point, from the transcript.}
+
+## What is shown
+- {What the images or video frames show, only where it carries information: numbers, a chart, code, a product, a screenshot, a place. Delete this whole section if nothing on screen matters.}
+
+## Takeaways
+- {1-5 bullets: the point of saving this, phrased as what to remember or do.}
+
+## Related
+- [[{Broader topic note this connects to}]]
+
+## Source
+- Post: {url}
+- Author: [[{channel}]]
+"""
+
 # =============================================================================
 # EDIT ME: Claude prompts
 # =============================================================================
 
 SYSTEM_PROMPT = """\
-You turn raw YouTube transcripts into clean, well-structured Obsidian notes for a personal \
-knowledge vault.
+You turn raw material saved from the web (a YouTube video's transcript, an Instagram post or \
+reel, a tweet) into clean, well-structured Obsidian notes for a personal knowledge vault.
 
 Rules:
 - Output ONLY the finished Markdown note. No preamble, no commentary, no code fences.
 - Follow the NOTE TEMPLATE exactly: same frontmatter keys, same section order and headings. \
 The frontmatter values already filled in must stay unchanged; only replace the {placeholders} \
-and remove the braces.
-- Tags: replace the {topic-tag} placeholders with 3-6 lowercase kebab-case tags specific to \
-the content (e.g. machine-learning, personal-finance, rust, interview). Keep the `youtube` tag.
+and remove the braces. A template section may be deleted only where the template says so.
+- Tags: replace the {topic-tag} placeholders with 2-6 lowercase kebab-case tags specific to \
+the content (e.g. machine-learning, personal-finance, rust, interview). Keep the platform tag \
+that is already there.
+- Short posts: when the material is a tweet or a caption, the Content section quotes the \
+author's own words, cleaned of hashtags and link noise; do not inflate a two-line post into \
+an essay. Attached images are labelled "Image N"; describe what they show only where it \
+carries information.
 - Wikilinks: wrap in [[double brackets]], with their usual capitalization (e.g. \
 [[Andrej Karpathy]], [[Neal.fun]]), the entities a reader would plausibly want a note about: \
 people central to the topic, tools, products, books, papers, and named concepts. Link each \
@@ -189,15 +233,19 @@ NOTE TEMPLATE (fill every {{placeholder}}, keep everything else exactly as-is):
 
 {template}
 
-VIDEO METADATA:
+METADATA:
+- Platform: {platform}
 - Title: {title}
-- Channel: {channel}
+- Channel / author: {channel}
 - URL: {url}
 - Published: {published}
 - Duration: {duration}
 - Chapters from the uploader:
 {chapters}
 - Description (truncated): {description}
+
+POST TEXT (the author's own words, with thread and quote context):
+{post_text}
 
 TRANSCRIPT (paragraphs prefixed with timestamp links):
 {transcript}
@@ -235,6 +283,28 @@ most one moment per 30 seconds of that walkthrough.
 - At most {max_moments} moments in total; fewer is better than padding. If nothing on screen \
 carries information, return an empty list.
 - For each moment give a short reason (under 12 words) naming what is on screen.
+"""
+
+# =============================================================================
+# EDIT ME: filing prompt
+# -----------------------------------------------------------------------------
+# After a note is written, Claude picks the folder it belongs in, given the folders
+# that already exist in the vault. New folders go under KNOWLEDGE_ROOT.
+# =============================================================================
+
+FILE_PROMPT = """\
+You file a new note into a personal Obsidian vault. Pick the folder it belongs in.
+
+Rules:
+- Prefer an existing folder from the list when the note fits it; check for close matches \
+before inventing a new name.
+- Otherwise create a new topic folder directly under "{root}/" (exactly two levels, \
+"{root}/<Topic>"), named in Title Case for a broad, durable subject, e.g. "{root}/Crypto \
+trading", "{root}/Programming", "{root}/Personal finance", "{root}/Health". Broad beats \
+narrow: a vault should end up with dozens of topics, not hundreds.
+- Never file under "Projects/" or "Life/" unless the note is explicitly about that existing \
+project or that part of the owner's life; never use the vault root or "Home".
+- Reply with JSON only: {{"folder": "{root}/Topic", "why": "under 12 words"}}
 """
 
 # =============================================================================
@@ -294,11 +364,24 @@ def _env_flag(name: str, default: str = "true") -> bool:
 # Attach the finished .md file to the Telegram chat. Turn off when the vault syncs by itself.
 SEND_NOTE_FILE = _env_flag("SEND_NOTE_FILE")
 
-# Shell command to run after each note is written, with {path} replaced by the note's path.
-# Typical use: upload the note to storage your vault syncs from, e.g.
-#   aws s3 cp {path} s3://my-vault/YouTube/      (Remotely Save plugin on your devices, S3 backend)
-#   rclone copy {path} dropbox:Vault/YouTube     (any rclone remote)
+# Shell command to run after each note is written. Placeholders: {path} = the note file,
+# {relpath} = its path inside the vault folder (e.g. "Knowledge/Programming/Title.md"),
+# {folder} = just the folder part. Typical use: upload the note to storage your vault syncs from:
+#   aws s3 cp {path} s3://my-vault/{relpath}          (Remotely Save plugin on your devices, S3 backend)
+#   rclone copyto {path} dropbox:Vault/{relpath}      (any rclone remote)
 AFTER_NOTE_COMMAND = os.environ.get("AFTER_NOTE_COMMAND", "").strip()
+
+# Automatic filing. Claude picks each note's folder from the folders already in the vault, or
+# creates a new topic folder under KNOWLEDGE_ROOT. VAULT_LIST_COMMAND prints the vault's file paths
+# (one per line; `aws s3 ls s3://my-vault --recursive` output is understood too) so the bot can see
+# the folders when the vault lives elsewhere; when empty, the folders under OBSIDIAN_VAULT_PATH are used.
+KNOWLEDGE_ROOT = os.environ.get("KNOWLEDGE_ROOT", "Knowledge").strip().strip("/") or "Knowledge"
+VAULT_LIST_COMMAND = os.environ.get("VAULT_LIST_COMMAND", "").strip()
+
+# Instagram posts and reels are fetched with gallery-dl (installed with the requirements); tweets
+# through the FixTweet API, which needs no account.
+GALLERY_DL_BIN = os.environ.get("GALLERY_DL_BIN", "").strip() or str(Path(sys.executable).parent / "gallery-dl")
+FXTWITTER_API = "https://api.fxtwitter.com"
 
 # Append the full timestamped transcript to the note in a folded section (searchable in Obsidian).
 INCLUDE_TRANSCRIPT = _env_flag("INCLUDE_TRANSCRIPT")
@@ -335,25 +418,55 @@ def format_timestamp(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def timestamp_link(video_id: str, seconds: float) -> str:
-    """Markdown link that opens the video at that moment, e.g. [3:12](https://youtu.be/ID?t=192)."""
-    return f"[{format_timestamp(seconds)}](https://youtu.be/{video_id}?t={int(seconds)})"
+PLATFORM_LABELS = {"youtube": "YouTube", "instagram": "Instagram", "x": "X"}
 
 
 @dataclass
-class VideoMeta:
-    video_id: str
+class Source:
+    """A supported link: which platform, the platform's id, and a canonical URL."""
+    kind: str  # youtube | instagram | x
+    id: str
+    url: str
+
+
+@dataclass
+class Item:
+    """One saved thing: a YouTube video, an Instagram post or reel, or a tweet."""
+    video_id: str  # the platform's id: YouTube video id, Instagram shortcode, tweet id
     url: str
     title: str
-    channel: str
+    channel: str  # channel or author display name
     published: str  # YYYY-MM-DD or "unknown"
     duration_seconds: int
     description: str
     chapters: list[tuple[float, str]] = field(default_factory=list)  # (start seconds, title)
+    kind: str = "youtube"
+    handle: str = ""  # @username where the platform has one
+    text: str = ""  # the post's own words (tweet, caption) with thread and quote context
+    audio_path: Path | None = None  # local media to transcribe (temp; reels and tweet videos)
+    video_path: Path | None = None  # local video for screenshots (temp; reels and tweet videos)
+    images: list[Path] = field(default_factory=list)  # images attached to the post (temp)
 
     @property
     def duration_str(self) -> str:
         return format_timestamp(self.duration_seconds)
+
+    @property
+    def platform(self) -> str:
+        return PLATFORM_LABELS.get(self.kind, self.kind)
+
+
+VideoMeta = Item  # earlier name, kept for callers
+
+
+def timestamp_link(item: Item | str, seconds: float) -> str:
+    """Markdown link to that moment. YouTube supports ?t=; other platforms link to the post itself."""
+    label = format_timestamp(seconds)
+    if isinstance(item, str):  # a YouTube video id
+        return f"[{label}](https://youtu.be/{item}?t={int(seconds)})"
+    if item.kind == "youtube":
+        return f"[{label}](https://youtu.be/{item.video_id}?t={int(seconds)})"
+    return f"[{label}]({item.url})"
 
 
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -392,6 +505,37 @@ def canonical_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+_INSTAGRAM_RE = re.compile(r"instagram\.com/(?:[A-Za-z0-9_.]+/)?(?:reels?|p|tv)/([A-Za-z0-9_-]+)", re.I)
+_X_RE = re.compile(
+    r"(?:^|[/.])(?:x|twitter|mobile\.twitter|vxtwitter|fxtwitter|fixupx)\.com/[A-Za-z0-9_]+/status(?:es)?/(\d+)",
+    re.I,
+)
+
+
+def parse_source(text: str) -> Source | None:
+    """Recognise a YouTube, Instagram, or X link anywhere in the message."""
+    video_id = extract_video_id(text)
+    if video_id:
+        return Source("youtube", video_id, canonical_url(video_id))
+    match = _INSTAGRAM_RE.search(text)
+    if match:
+        return Source("instagram", match.group(1), f"https://www.instagram.com/p/{match.group(1)}/")
+    match = _X_RE.search(text)
+    if match:
+        return Source("x", match.group(1), f"https://x.com/i/status/{match.group(1)}")
+    return None
+
+
+def _title_from_text(text: str, fallback: str, limit: int = 80) -> str:
+    """First line of a caption or tweet, tidied and shortened, as a note title."""
+    first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    first = re.sub(r"https?://\S+", "", first)
+    first = re.sub(r"\s+", " ", first).strip(" -–—:|")
+    if len(first) > limit:
+        first = first[:limit].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
+    return first or fallback
+
+
 _FILENAME_BAD_RE = re.compile(r'[<>:"/\\|?*\[\]#^\x00-\x1f]')
 
 
@@ -413,17 +557,24 @@ def _wikilink_safe(value: str) -> str:
     return re.sub(r"[\[\]|#^]", "", value).strip()
 
 
-def render_template(meta: VideoMeta) -> str:
-    """Fill the metadata placeholders in NOTE_TEMPLATE; Claude fills the rest."""
+def template_for(meta: Item) -> str:
+    """Videos get the full note; Instagram posts, reels, and tweets get the short-form one."""
+    return POST_TEMPLATE if meta.kind in {"instagram", "x"} else NOTE_TEMPLATE
+
+
+def render_template(meta: Item, template: str | None = None) -> str:
+    """Fill the metadata placeholders in the template; Claude fills the rest."""
     fills = {
         "{title}": _yaml_safe(meta.title),
         "{url}": meta.url,
         "{channel}": _wikilink_safe(_yaml_safe(meta.channel)),
+        "{platform}": meta.kind,
+        "{handle}": meta.handle,
         "{published}": meta.published,
         "{date}": date.today().isoformat(),
         "{duration}": meta.duration_str,
     }
-    text = NOTE_TEMPLATE
+    text = template if template is not None else template_for(meta)
     for placeholder, value in fills.items():
         text = text.replace(placeholder, value)
     return text
@@ -524,7 +675,7 @@ def download_audio(video_id: str, out_dir: Path) -> tuple[VideoMeta, Path]:
         for c in (info.get("chapters") or [])
         if c.get("start_time") is not None and c.get("title")
     ]
-    meta = VideoMeta(
+    meta = Item(
         video_id=video_id,
         url=info.get("webpage_url") or url,
         title=(info.get("title") or f"YouTube video {video_id}").strip(),
@@ -533,9 +684,162 @@ def download_audio(video_id: str, out_dir: Path) -> tuple[VideoMeta, Path]:
         duration_seconds=int(info.get("duration") or 0),
         description=(info.get("description") or "").strip()[:500],
         chapters=chapters,
+        kind="youtube",
+        handle=(info.get("uploader_id") or "").lstrip("@"),
+        audio_path=audio_path,
     )
     log.info("Downloaded %s (%s) -> %s", meta.title, meta.duration_str, audio_path.name)
     return meta, audio_path
+
+
+_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
+_VIDEO_EXT = {".mp4", ".mov", ".webm", ".mkv"}
+
+
+def _media_duration(path: Path | None) -> int:
+    if path is None:
+        return 0
+    try:
+        with av.open(str(path)) as container:
+            return int((container.duration or 0) / av.time_base)
+    except Exception:  # not a decodable media file
+        return 0
+
+
+def _http_get_json(url: str) -> dict:
+    response = httpx.get(url, timeout=30, follow_redirects=True, headers={"User-Agent": "yt2obsidian"})
+    if response.status_code != 200:
+        raise PipelineError(f"Request failed (HTTP {response.status_code}): {url}")
+    return response.json()
+
+
+def _download_file(url: str, dest: Path) -> Path:
+    with httpx.stream("GET", url, timeout=120, follow_redirects=True, headers={"User-Agent": "yt2obsidian"}) as r:
+        if r.status_code != 200:
+            raise PipelineError(f"Media download failed (HTTP {r.status_code})")
+        with dest.open("wb") as fh:
+            for chunk in r.iter_bytes():
+                fh.write(chunk)
+    return dest
+
+
+def fetch_instagram(shortcode: str, url: str, out_dir: Path) -> Item:
+    """Blocking. Downloads an Instagram post or reel (media plus caption) with gallery-dl."""
+    command = [GALLERY_DL_BIN, "-q", "-D", str(out_dir), "--write-metadata"]
+    if YTDLP_COOKIES_FILE:
+        command += ["--cookies", YTDLP_COOKIES_FILE]
+    command.append(url)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=600)
+    except FileNotFoundError as exc:
+        raise PipelineError(f"gallery-dl not found at {GALLERY_DL_BIN}; it is needed for Instagram links") from exc
+    files = sorted(p for p in out_dir.iterdir() if p.is_file())
+    media = [p for p in files if p.suffix.lower() in _IMAGE_EXT | _VIDEO_EXT]
+    if not media:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        detail = re.sub(r"^\[[^\]]*\]\s*", "", detail[-1]) if detail else "no media returned"
+        hint = " Instagram needs a logged-in cookies file (YTDLP_COOKIES_FILE)." if "login" in detail.lower() or "401" in detail or "403" in detail else ""
+        raise PipelineError(f"Could not fetch the Instagram post: {detail[:200]}.{hint}")
+    meta: dict = {}
+    for p in files:
+        if p.suffix == ".json":
+            with contextlib.suppress(ValueError):
+                meta = json.loads(p.read_text())
+                break
+    caption = str(meta.get("description") or "").strip()
+    username = str(meta.get("username") or "").strip()
+    fullname = str(meta.get("fullname") or username or "Instagram").strip()
+    raw_date = str(meta.get("date") or "")
+    published = raw_date[:10] if re.match(r"\d{4}-\d{2}-\d{2}", raw_date) else "unknown"
+    videos = [p for p in media if p.suffix.lower() in _VIDEO_EXT]
+    images = [p for p in media if p.suffix.lower() in _IMAGE_EXT]
+    video = videos[0] if videos else None
+    item = Item(
+        video_id=shortcode,
+        url=str(meta.get("post_url") or url),
+        title=_title_from_text(caption, f"Instagram post by @{username or shortcode}"),
+        channel=fullname,
+        published=published,
+        duration_seconds=_media_duration(video),
+        description=caption[:500],
+        kind="instagram",
+        handle=username,
+        text=caption,
+        audio_path=video,
+        video_path=video,
+        images=images,
+    )
+    log.info("Fetched Instagram %s: %d image(s), %s", shortcode, len(images), "video" if video else "no video")
+    return item
+
+
+def fetch_x(tweet_id: str, out_dir: Path) -> Item:
+    """Blocking. Fetches a tweet with its media, quoted tweet, and earlier tweets of the thread (FixTweet API)."""
+
+    def get(tid: str) -> dict:
+        data = _http_get_json(f"{FXTWITTER_API}/status/{tid}")
+        tweet = data.get("tweet")
+        if not tweet:
+            raise PipelineError(f"Could not fetch the tweet: {data.get('message') or 'no data'}")
+        return tweet
+
+    def line(t: dict) -> str:
+        author = t.get("author") or {}
+        return f"@{author.get('screen_name') or '?'} ({author.get('name') or ''}): {str(t.get('text') or '').strip()}"
+
+    tweet = get(tweet_id)
+    parents: list[dict] = []
+    parent_id, seen = tweet.get("replying_to_status"), set()
+    while parent_id and len(parents) < 6 and parent_id not in seen:
+        seen.add(parent_id)
+        try:
+            parent = get(str(parent_id))
+        except PipelineError:
+            break
+        parents.append(parent)
+        parent_id = parent.get("replying_to_status")
+    parents.reverse()
+
+    parts = []
+    if parents:
+        parts.append("Earlier tweets in this thread, oldest first:\n" + "\n\n".join(line(p) for p in parents))
+    parts.append("This tweet:\n" + line(tweet))
+    if tweet.get("quote"):
+        parts.append("Quoted tweet:\n" + line(tweet["quote"]))
+
+    media = tweet.get("media") or {}
+    images: list[Path] = []
+    for i, photo in enumerate(media.get("photos") or []):
+        photo_url = photo.get("url")
+        if photo_url:
+            suffix = Path(photo_url.split("?")[0]).suffix or ".jpg"
+            images.append(_download_file(photo_url, out_dir / f"photo_{i:02d}{suffix}"))
+    video = None
+    videos = media.get("videos") or []
+    if videos and videos[0].get("url"):
+        video = _download_file(videos[0]["url"], out_dir / "video.mp4")
+
+    author = tweet.get("author") or {}
+    handle = str(author.get("screen_name") or "")
+    tweet_text = str(tweet.get("text") or "")
+    created = tweet.get("created_timestamp")
+    item = Item(
+        video_id=tweet_id,
+        url=str(tweet.get("url") or f"https://x.com/i/status/{tweet_id}"),
+        title=f"@{handle}: " + _title_from_text(tweet_text, f"tweet {tweet_id}", limit=70),
+        channel=str(author.get("name") or handle or "X"),
+        published=date.fromtimestamp(created).isoformat() if created else "unknown",
+        duration_seconds=_media_duration(video) or int((videos[0].get("duration") or 0) if videos else 0),
+        description=tweet_text[:500],
+        kind="x",
+        handle=handle,
+        text="\n\n".join(parts),
+        audio_path=video,
+        video_path=video,
+        images=images,
+    )
+    log.info("Fetched tweet %s by @%s: %d image(s), %s, %d earlier in thread", tweet_id, handle, len(images), "video" if video else "no video", len(parents))
+    return item
 
 
 def download_video_stream(video_id: str, out_dir: Path) -> Path | None:
@@ -728,8 +1032,8 @@ _TIMESTAMP_LINK_RE = re.compile(r"\[\d{1,2}:\d{2}(?::\d{2})?\]\(https?://\S+?\)"
 Segment = tuple[float, float, str]  # (start seconds, end seconds, text)
 
 
-def format_transcript(segments: list[Segment], video_id: str) -> str:
-    """Group segments into ~90-word paragraphs, each prefixed with a timestamp link."""
+def format_transcript(segments: list[Segment], video_id: Item | str) -> str:
+    """Group segments into ~90-word paragraphs, each prefixed with a timestamp link (item or YouTube id)."""
     paragraphs: list[str] = []
     current: list[str] = []
     start: float | None = None
@@ -914,7 +1218,7 @@ def _link_bare_timestamps(body: str, meta: VideoMeta) -> str:
         seconds = parts[0] * 60 + parts[1] if len(parts) == 2 else parts[0] * 3600 + parts[1] * 60 + parts[2]
         if meta.duration_seconds and seconds > meta.duration_seconds + 5:
             return match.group(0)  # not a timestamp of this video (e.g. a "16:9" ratio)
-        return timestamp_link(meta.video_id, seconds)
+        return timestamp_link(meta, seconds)
 
     return _BARE_TIMESTAMP_RE.sub(repl, body)
 
@@ -964,26 +1268,41 @@ def append_transcript(note: str, transcript: str) -> str:
 
 FRAMES_INTRO = (
     "FRAMES: screenshots of the moments a first pass judged to show something informative on "
-    "screen, each labelled with the timestamp link of that moment and the reason it was picked. "
+    "screen, each labelled with the timestamp link of that moment and the reason it was picked, "
+    "plus any images attached to the post, labelled Image N. "
     "Use them only for informative on-screen content (code, slides, diagrams, charts, tables, UI, "
     "on-screen text) that the speech does not already convey. Ignore the presenter, backgrounds, "
     "memes, stock footage, B-roll, and any sponsor or ad screens; those never belong in the note."
 )
 
 
-async def generate_note(meta: VideoMeta, transcript: str, frames: list[Frame] = ()) -> str:
-    """Ask Claude to turn the transcript (plus optional screenshots) into a note following NOTE_TEMPLATE."""
-    chapters = "\n".join(f"- {timestamp_link(meta.video_id, start)} {title}" for start, title in meta.chapters)
+def _frame_label(meta: Item, seconds: float, why: str) -> str:
+    """Frames from a video carry a timestamp; images attached to a post are numbered (seconds < 0)."""
+    if seconds < 0:
+        return f"Image {int(-seconds)} ({why}):"
+    return f"Frame at {timestamp_link(meta, seconds)} ({why}):"
+
+
+def images_as_frames(images: list[Path]) -> list[Frame]:
+    """Attached images ride along with the screenshots; negative 'seconds' marks them as images."""
+    return [(-(i + 1), "image attached to the post", path.read_bytes()) for i, path in enumerate(images)]
+
+
+async def generate_note(meta: Item, transcript: str, frames: list[Frame] = ()) -> str:
+    """Ask Claude to turn the material (transcript, post text, screenshots, images) into a note."""
+    chapters = "\n".join(f"- {timestamp_link(meta, start)} {title}" for start, title in meta.chapters)
     prompt = USER_PROMPT.format(
         template=render_template(meta),
+        platform=meta.platform,
         title=meta.title,
-        channel=meta.channel,
+        channel=meta.channel + (f" (@{meta.handle})" if meta.handle else ""),
         url=meta.url,
         published=meta.published,
-        duration=meta.duration_str,
+        duration=meta.duration_str if meta.duration_seconds else "(no video)",
         chapters=chapters or "(none provided)",
         description=meta.description or "(none)",
-        transcript=transcript,
+        post_text=meta.text or "(none)",
+        transcript=transcript or "(no audio)",
     )
     if NOTE_BACKEND == "claude-code":
         return await _generate_note_claude_code(meta, prompt, frames)
@@ -992,7 +1311,7 @@ async def generate_note(meta: VideoMeta, transcript: str, frames: list[Frame] = 
     if frames:
         content.append({"type": "text", "text": FRAMES_INTRO})
         for seconds, why, data in frames:
-            content.append({"type": "text", "text": f"Frame at {timestamp_link(meta.video_id, seconds)} ({why}):"})
+            content.append({"type": "text", "text": _frame_label(meta, seconds, why)})
             content.append({
                 "type": "image",
                 "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(data).decode()},
@@ -1038,8 +1357,8 @@ async def generate_note(meta: VideoMeta, transcript: str, frames: list[Frame] = 
     return _clean_note(text, meta)
 
 
-async def _generate_note_claude_code(meta: VideoMeta, prompt: str, frames: list[Frame]) -> str:
-    """Same note, written by the Claude Code CLI; screenshots are passed as files it reads itself."""
+async def _generate_note_claude_code(meta: Item, prompt: str, frames: list[Frame]) -> str:
+    """Same note, written by the Claude Code CLI; screenshots and images are passed as files it reads itself."""
     with tempfile.TemporaryDirectory(prefix="yt2obsidian-frames-") as tmp:
         parts: list[str] = []
         if frames:
@@ -1047,7 +1366,7 @@ async def _generate_note_claude_code(meta: VideoMeta, prompt: str, frames: list[
             for i, (seconds, why, data) in enumerate(frames):
                 path = Path(tmp) / f"frame_{i:02d}.jpg"
                 path.write_bytes(data)
-                listing.append(f"- {path} — frame at {timestamp_link(meta.video_id, seconds)} ({why})")
+                listing.append(f"- {path} — {_frame_label(meta, seconds, why).rstrip(':')}")
             parts.append(
                 FRAMES_INTRO
                 + "\nThe frames are image files; open every one of them with the Read tool before writing:\n"
@@ -1073,18 +1392,110 @@ async def _generate_note_claude_code(meta: VideoMeta, prompt: str, frames: list[
 # =============================================================================
 
 
-def write_note(note: str, meta: VideoMeta) -> Path:
-    """Blocking. Writes the note under VAULT_PATH, never overwriting an existing file."""
-    stem = safe_filename(meta.title)
-    path = VAULT_PATH / f"{stem}.md"
-    counter = 2
-    while path.exists():
-        path = VAULT_PATH / f"{stem} ({counter}).md"
-        counter += 1
+class FolderChoice(BaseModel):
+    folder: str
+    why: str = ""
+
+
+_S3_LISTING_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s+\d+\s+(.+)$")
+
+
+def folders_from_listing(lines: list[str]) -> list[str]:
+    """Folders (deepest first not required) from a list of file paths or `aws s3 ls --recursive` lines."""
+    folders: set[str] = set()
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        match = _S3_LISTING_RE.match(line)
+        key = match.group(1) if match else line
+        parent = key.replace("\\", "/").rsplit("/", 1)[0] if "/" in key else ""
+        if not parent or any(part.startswith(".") for part in parent.split("/")):
+            continue
+        folders.add(parent)
+        # every ancestor is a folder too
+        while "/" in parent:
+            parent = parent.rsplit("/", 1)[0]
+            folders.add(parent)
+    return sorted(folders)
+
+
+def list_vault_folders() -> list[str]:
+    """Blocking. The folders that exist in the vault, from VAULT_LIST_COMMAND or the local vault folder."""
+    if VAULT_LIST_COMMAND:
+        try:
+            result = subprocess.run(VAULT_LIST_COMMAND, shell=True, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0:
+                return folders_from_listing(result.stdout.splitlines())
+            log.warning("VAULT_LIST_COMMAND failed (exit %d): %s", result.returncode, result.stderr.strip()[:200])
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log.warning("VAULT_LIST_COMMAND failed: %s", exc)
+    if VAULT_PATH.is_dir():
+        paths = [str(p.relative_to(VAULT_PATH)) for p in VAULT_PATH.rglob("*") if p.is_file()]
+        return folders_from_listing(paths)
+    return []
+
+
+def normalize_folder(folder: str, existing: list[str]) -> str:
+    """Make Claude's folder choice safe: an existing folder as spelled, or a two-level path under KNOWLEDGE_ROOT."""
+    parts = [safe_filename(p, 60) for p in folder.replace("\\", "/").split("/") if p.strip()]
+    inbox = f"{KNOWLEDGE_ROOT}/Inbox"
+    if not parts:
+        return inbox
+    candidate = "/".join(parts)
+    by_lower = {f.lower(): f for f in existing}
+    if candidate.lower() in {KNOWLEDGE_ROOT.lower(), "projects"}:  # a container, not a place for notes
+        return inbox
+    if candidate.lower() in by_lower:
+        return by_lower[candidate.lower()]
+    if parts[0].lower() == KNOWLEDGE_ROOT.lower():
+        return f"{KNOWLEDGE_ROOT}/{parts[1]}" if len(parts) > 1 else inbox
+    if parts[0].lower() == "home":
+        return inbox
+    leaf = parts[-1]
+    if f"{KNOWLEDGE_ROOT}/{leaf}".lower() in by_lower:
+        return by_lower[f"{KNOWLEDGE_ROOT}/{leaf}".lower()]
+    return f"{KNOWLEDGE_ROOT}/{leaf}"
+
+
+async def choose_folder(meta: Item, note: str) -> str:
+    """Ask Claude where the note belongs, given the vault's existing folders. Falls back to KNOWLEDGE_ROOT/Inbox."""
+    existing = await asyncio.to_thread(list_vault_folders)
+    head = "\n".join(note.split("\n## Notes", 1)[0].split("\n## Content", 1)[0].splitlines()[:60])
+    prompt = f"NOTE ({meta.platform}):\n{head}\n\nEXISTING FOLDERS:\n" + ("\n".join(existing) or "(none yet)")
+    system = FILE_PROMPT.format(root=KNOWLEDGE_ROOT)
     try:
+        if NOTE_BACKEND == "claude-code":
+            text, _usage = await claude_code_complete(system, prompt, CUE_MODEL)
+            choice = FolderChoice.model_validate_json(_extract_json(text))
+        else:
+            response = await get_anthropic().messages.parse(
+                model=CUE_MODEL, max_tokens=300, system=system, output_config={"effort": "low"},
+                messages=[{"role": "user", "content": prompt}], output_format=FolderChoice,
+            )
+            choice = response.parsed_output or FolderChoice(folder="")
+    except (PipelineError, anthropic.APIError, ValueError) as exc:  # pydantic's ValidationError is a ValueError
+        log.warning("Filing failed; using %s/Inbox: %s", KNOWLEDGE_ROOT, exc)
+        return f"{KNOWLEDGE_ROOT}/Inbox"
+    folder = normalize_folder(choice.folder, existing)
+    log.info("Filed under %s (%s)", folder, choice.why)
+    return folder
+
+
+def write_note(note: str, meta: Item, folder: str = "") -> Path:
+    """Blocking. Writes the note under VAULT_PATH/<folder>, never overwriting an existing file."""
+    target_dir = VAULT_PATH / folder if folder else VAULT_PATH
+    stem = safe_filename(meta.title)
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"{stem}.md"
+        counter = 2
+        while path.exists():
+            path = target_dir / f"{stem} ({counter}).md"
+            counter += 1
         path.write_text(note, encoding="utf-8")
     except OSError as exc:
-        raise PipelineError(f"Could not write the note to {path}: {exc}") from exc
+        raise PipelineError(f"Could not write the note under {target_dir}: {exc}") from exc
     log.info("Wrote note %s", path)
     return path
 
@@ -1092,9 +1503,18 @@ def write_note(note: str, meta: VideoMeta) -> Path:
 def run_after_note_command(path: Path) -> None:
     """Blocking. Runs AFTER_NOTE_COMMAND for a freshly written note; raises PipelineError on failure."""
     # shell=True is intentional: the command is the operator's own .env setting (pipes and redirects
-    # allowed), and the only value substituted into it is the note path, quoted with shlex.quote so a
-    # video title can never inject shell syntax.
-    command = AFTER_NOTE_COMMAND.replace("{path}", shlex.quote(str(path)))
+    # allowed), and the only values substituted into it are the note's paths, quoted with shlex.quote so
+    # a video title can never inject shell syntax.
+    try:
+        relpath = path.resolve().relative_to(VAULT_PATH.resolve())
+    except ValueError:
+        relpath = Path(path.name)
+    folder = str(relpath.parent) if str(relpath.parent) != "." else ""
+    command = (
+        AFTER_NOTE_COMMAND.replace("{path}", shlex.quote(str(path)))
+        .replace("{relpath}", shlex.quote(str(relpath)))
+        .replace("{folder}", shlex.quote(folder))
+    )
     try:
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=600)
     except subprocess.TimeoutExpired as exc:
@@ -1119,7 +1539,7 @@ def _is_allowed(update: Update) -> bool:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     await update.effective_message.reply_text(
-        "Send a YouTube link to get a structured note for your vault.\n\n"
+        "Send a YouTube, Instagram, or X link to get a structured note filed into your vault.\n\n"
         f"Your Telegram user id: {user.id if user else 'unknown'}"
     )
 
@@ -1134,16 +1554,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await message.reply_text("This bot is private.")
         return
 
-    video_id = extract_video_id(message.text or "")
-    if not video_id:
-        await message.reply_text("Not a YouTube link. Send a youtube.com or youtu.be video URL.")
+    source = parse_source(message.text or "")
+    if source is None:
+        await message.reply_text("Not a supported link. Send a YouTube, Instagram, or X (Twitter) post URL.")
         return
 
     # Hand the heavy work to a background task so the handler (and the bot) stays responsive;
     # the task posts one status message and updates it as the job progresses.
-    context.application.create_task(
-        process_video(video_id, message.chat_id, context), update=update
-    )
+    context.application.create_task(process_item(source, message.chat_id, context), update=update)
 
 
 class JobStatus:
@@ -1222,30 +1640,44 @@ class JobStatus:
         await self.step(reason)
 
 
-async def process_video(video_id: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def fetch_item(source: Source, tmp: Path) -> Item:
+    """Download whatever the link points at into tmp and describe it as an Item."""
+    if source.kind == "youtube":
+        meta, _audio = await asyncio.to_thread(download_audio, source.id, tmp)
+        return meta
+    if source.kind == "instagram":
+        return await asyncio.to_thread(fetch_instagram, source.id, source.url, tmp)
+    return await asyncio.to_thread(fetch_x, source.id, tmp)
+
+
+async def process_item(source: Source, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     status = JobStatus(context.bot, chat_id)
-    log.info("Job started for video %s", video_id)
+    log.info("Job started for %s %s", source.kind, source.id)
     try:
         await status.start("Downloading")
         with tempfile.TemporaryDirectory(prefix="yt2obsidian-") as tmp:
-            meta, audio_path = await asyncio.to_thread(download_audio, video_id, Path(tmp))
-            status.title = f"{meta.title} ({meta.duration_str})"
+            meta = await fetch_item(source, Path(tmp))
+            status.title = f"{meta.title} ({meta.duration_str})" if meta.duration_seconds else meta.title
             await status.step("Downloaded")
 
-            if TRANSCRIBE_LOCK.locked():
-                await status.pending_step("Queued behind another video")
-            async with TRANSCRIBE_LOCK:
-                await status.pending_step("Transcribing")
-                segments = await asyncio.to_thread(transcribe_audio, audio_path, meta.video_id)
-            transcript = format_transcript(segments, meta.video_id)
-            await status.step(f"Transcribed — {transcript_word_count(transcript):,} words")
+            transcript, segments = "", []
+            if meta.audio_path is not None:
+                if TRANSCRIBE_LOCK.locked():
+                    await status.pending_step("Queued behind another video")
+                async with TRANSCRIBE_LOCK:
+                    await status.pending_step("Transcribing")
+                    segments = await asyncio.to_thread(transcribe_audio, meta.audio_path, meta.video_id)
+                transcript = format_transcript(segments, meta)
+                await status.step(f"Transcribed — {transcript_word_count(transcript):,} words")
 
-            # Screenshots only at the moments Claude picks; skip the video download when there are none.
+            # Screenshots only at the moments Claude picks; YouTube's video stream is fetched only then.
             frames: list[Frame] = []
-            cues = await find_screen_cues(segments, meta) if INCLUDE_FRAMES else []
+            cues = await find_screen_cues(segments, meta) if segments and INCLUDE_FRAMES else []
             if cues:
                 await status.pending_step("Selecting screenshots")
-                video_path = await asyncio.to_thread(download_video_stream, video_id, Path(tmp))
+                video_path = meta.video_path
+                if video_path is None and source.kind == "youtube":
+                    video_path = await asyncio.to_thread(download_video_stream, source.id, Path(tmp))
                 if video_path is not None:
                     try:
                         frames = await asyncio.to_thread(extract_frames, video_path, meta, Path(tmp), cues)
@@ -1255,19 +1687,26 @@ async def process_video(video_id: str, chat_id: int, context: ContextTypes.DEFAU
                     await status.step(f"Screenshots — {len(frames)}")
                 else:
                     await status.drop_pending()
-        # Leaving the `with` block deletes the temp directory with the audio, video, and frames.
+            if meta.images:
+                frames += images_as_frames(meta.images)
+                await status.step(f"Images — {len(meta.images)}")
+        # Leaving the `with` block deletes the temp directory with the audio, video, images, and frames.
 
         await status.pending_step("Writing note")
         note = await generate_note(meta, transcript, frames)
-        if INCLUDE_TRANSCRIPT:
+        if INCLUDE_TRANSCRIPT and transcript:
             note = append_transcript(note, transcript)
-        path = await asyncio.to_thread(write_note, note, meta)
+
+        await status.pending_step("Filing")
+        folder = await choose_folder(meta, note)
+        path = await asyncio.to_thread(write_note, note, meta, folder)
+        await status.step(f"Filed under {folder}")
 
         result = f"Note saved: {path.stem}"
         if AFTER_NOTE_COMMAND:
             try:
                 await asyncio.to_thread(run_after_note_command, path)
-                result = f"Note added to vault: {path.stem}"
+                result = f"Note added to vault: {folder}/{path.stem}"
             except PipelineError as exc:
                 log.warning("%s", exc)
                 await status.step(str(exc))
@@ -1282,18 +1721,18 @@ async def process_video(video_id: str, chat_id: int, context: ContextTypes.DEFAU
             except TelegramError as exc:
                 log.warning("Could not send the note file to Telegram: %s", exc)
                 await status.step(f"Sending the file failed: {exc}. The note is at {path}")
-        log.info("Job finished for video %s", video_id)
+        log.info("Job finished for %s %s", source.kind, source.id)
 
     except PipelineError as exc:
-        log.warning("Job failed for video %s: %s", video_id, exc)
+        log.warning("Job failed for %s %s: %s", source.kind, source.id, exc)
         await status.fail(str(exc))
     except asyncio.CancelledError:  # the bot is shutting down (restart, deploy, OS update) mid-job
-        log.warning("Job for video %s cancelled by shutdown", video_id)
+        log.warning("Job for %s %s cancelled by shutdown", source.kind, source.id)
         with contextlib.suppress(Exception):
             await status.fail("The bot restarted while processing. Send the link again.")
         raise
     except Exception as exc:  # noqa: BLE001 - last resort: never fail silently
-        log.exception("Unexpected error while processing video %s", video_id)
+        log.exception("Unexpected error while processing %s %s", source.kind, source.id)
         await status.fail(f"Unexpected error ({exc.__class__.__name__}): {exc}")
 
 
@@ -1342,6 +1781,8 @@ def _check_config() -> None:
         sys.exit("Fix the .env file (see .env.example) and start again.")
     if not ALLOWED_USER_IDS:
         log.warning("TELEGRAM_ALLOWED_USER_IDS is empty: anyone who finds the bot can use it.")
+    if not (shutil.which(GALLERY_DL_BIN) or Path(GALLERY_DL_BIN).is_file()):
+        log.warning("gallery-dl not found at %s: Instagram links will fail (pip install gallery-dl).", GALLERY_DL_BIN)
 
 
 def main() -> None:

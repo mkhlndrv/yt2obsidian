@@ -3,6 +3,8 @@ python-telegram-bot>=22.0
 httpx
 # [default] adds the YouTube JS-challenge solver, [deno] bundles the JavaScript runtime it needs
 yt-dlp[default,deno]>=2026.1.1
+# Instagram posts and reels
+gallery-dl>=1.30
 faster-whisper>=1.1.0
 # numpy and av come with faster-whisper; listed because bot.py imports them directly (screenshots)
 numpy

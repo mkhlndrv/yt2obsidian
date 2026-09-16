@@ -1,5 +1,5 @@
 """Exercise generate_note() and the Telegram handlers with stubbed Anthropic / Telegram objects."""
-import os, sys, asyncio, types, shlex
+import os, sys, asyncio, types, shlex, json
 os.environ.update(TELEGRAM_BOT_TOKEN="x", ANTHROPIC_API_KEY="x", OBSIDIAN_VAULT_PATH=__import__("tempfile").mkdtemp(prefix="yt2obsidian-test-"))
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
 import anthropic, httpx2 as httpx
@@ -96,7 +96,7 @@ async def main():
     assert note == note_text + "\n", note
     args, stdin_text = calls_cc[-1]
     assert args[:4] == ["--system-prompt", bot.SYSTEM_PROMPT, "--model", bot.CLAUDE_MODEL] and "--add-dir" in args, args
-    assert "frame_00.jpg — frame at [0:12](https://youtu.be/dQw4w9WgXcQ?t=12) (the code)" in stdin_text and "hello transcript" in stdin_text
+    assert "frame_00.jpg — Frame at [0:12](https://youtu.be/dQw4w9WgXcQ?t=12) (the code)" in stdin_text and "hello transcript" in stdin_text
     note = await bot.generate_note(meta, "t", frames=[])
     assert "--allowedTools" not in calls_cc[-1][0] and calls_cc[-1][0][-2:] == ["--max-turns", "1"], calls_cc[-1][0]
     async def cli_error(args, stdin_text): raise bot.PipelineError("Claude Code error: usage limit reached")
@@ -186,9 +186,10 @@ async def main():
                                                           send_document=send_document),
                                 application=types.SimpleNamespace(create_task=create_task))
     def status(): return edits[-1][1]   # the job's status message as last edited
+    SRC = bot.Source("youtube", "dQw4w9WgXcQ", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
 
     await bot.handle_message(mk_update("hi there"), ctx)
-    assert replies[-1] == "Not a YouTube link. Send a youtube.com or youtu.be video URL." and not tasks
+    assert replies[-1] == "Not a supported link. Send a YouTube, Instagram, or X (Twitter) post URL." and not tasks
     n_replies = len(replies)
     await bot.handle_message(mk_update("https://youtu.be/dQw4w9WgXcQ"), ctx)
     assert len(tasks) == 1 and len(replies) == n_replies   # no chatter: the job's own status message does the talking
@@ -217,18 +218,18 @@ async def main():
     # process_video: download failure surfaces as a clear message, nothing else runs
     def boom(*a, **k): raise bot.PipelineError("Could not download the video: Video unavailable")
     bot.download_audio = boom
-    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    await bot.process_item(SRC, 7, ctx)
     assert sent[-1] == (7, "Processing\n\nDownloading…"), sent[-1]
     assert status() == "Failed\n\nCould not download the video: Video unavailable", status()
     def crash(*a, **k): raise RuntimeError("weird")
     bot.download_audio = crash
-    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    await bot.process_item(SRC, 7, ctx)
     assert status() == "Failed\n\nUnexpected error (RuntimeError): weird", status()
     # shutdown mid-job: the status message says so and the cancellation still propagates
     def cancelled(*a, **k): raise asyncio.CancelledError()
     bot.download_audio = cancelled
     try:
-        await bot.process_video("dQw4w9WgXcQ", 7, ctx); raise AssertionError("cancellation swallowed")
+        await bot.process_item(SRC, 7, ctx); raise AssertionError("cancellation swallowed")
     except asyncio.CancelledError:
         pass
     assert status() == "Failed\n\nThe bot restarted while processing. Send the link again.", status()
@@ -238,18 +239,34 @@ async def main():
     import pathlib, shutil, tempfile
     v = pathlib.Path(os.environ["OBSIDIAN_VAULT_PATH"]); shutil.rmtree(v, ignore_errors=True); v.mkdir()
     def fake_download(vid, out_dir):
-        p = out_dir / "audio.m4a"; p.write_bytes(b"x"); return meta, p
+        p = out_dir / "audio.m4a"; p.write_bytes(b"x"); meta.audio_path = p; return meta, p
     seen = {}
+
+    # choose_folder: Claude's pick is normalised against the vault's folders; failures fall back to Inbox
+    (v / "Knowledge" / "Crypto trading").mkdir(parents=True); (v / "Knowledge" / "Crypto trading" / "x.md").write_text("x")
+    bot._anthropic_client, captured = fake_client(parsed=bot.FolderChoice(folder="knowledge/crypto trading", why="memecoins"))
+    assert await bot.choose_folder(meta, note_text) == "Knowledge/Crypto trading"
+    assert captured["output_format"] is bot.FolderChoice and "EXISTING FOLDERS:\nKnowledge\nKnowledge/Crypto trading" in captured["messages"][0]["content"]
+    assert captured["system"] == bot.FILE_PROMPT.format(root="Knowledge")
+    bot._anthropic_client, _ = fake_client(parsed=bot.FolderChoice(folder="Projects/Brand new"))
+    assert await bot.choose_folder(meta, note_text) == "Knowledge/Brand new"
+    bot._anthropic_client, _ = fake_client(exc=anthropic.APIConnectionError(request=req))
+    assert await bot.choose_folder(meta, note_text) == "Knowledge/Inbox"
+    shutil.rmtree(v / "Knowledge")
+    print("choose_folder OK")
+    async def fake_choose(m, note): return "Knowledge/Testing"
+    bot.choose_folder = fake_choose
     def fake_transcribe(p, video_id): seen["audio_existed"] = p.exists(); seen["path"] = p; seen["vid"] = video_id; return [(0.0, 1.0, "one two three")]
     bot.download_audio = fake_download; bot.transcribe_audio = fake_transcribe
     bot.INCLUDE_TRANSCRIPT = False
     bot.INCLUDE_FRAMES = False
     bot._anthropic_client, _ = fake_client(fake_message(note_text))
     n_before = len(sent)
-    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    await bot.process_item(SRC, 7, ctx)
     assert len(sent) == n_before + 1, "exactly one status message per job"
-    assert status() == "Done\nA Talk (1:05)\n\nDownloaded\nTranscribed — 3 words\nNote saved: A Talk", status()
-    assert (v / "A Talk.md").read_text() == note_text + "\n"
+    assert status() == "Done\nA Talk (1:05)\n\nDownloaded\nTranscribed — 3 words\nFiled under Knowledge/Testing\nNote saved: A Talk", status()
+    NOTES = v / "Knowledge" / "Testing"
+    assert (NOTES / "A Talk.md").read_text() == note_text + "\n"
     assert docs == [(7, (note_text + "\n").encode(), "A Talk.md", "A Talk")], docs
     assert seen["audio_existed"] and not seen["path"].exists(), "temp audio not deleted"
     assert seen["vid"] == "dQw4w9WgXcQ"
@@ -258,8 +275,8 @@ async def main():
     # with INCLUDE_TRANSCRIPT the saved note and the sent file carry the folded transcript
     bot.INCLUDE_TRANSCRIPT = True
     bot._anthropic_client, _ = fake_client(fake_message(note_text))
-    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
-    saved = (v / "A Talk (2).md").read_text()
+    await bot.process_item(SRC, 7, ctx)
+    saved = (NOTES / "A Talk (2).md").read_text()
     assert saved.endswith("## Transcript\n> [!quote]- Full transcript (speech recognition, may contain errors)\n> [0:00](https://youtu.be/dQw4w9WgXcQ?t=0) one two three\n"), saved
     assert docs[-1][1] == saved.encode()
     bot.INCLUDE_TRANSCRIPT = False
@@ -273,13 +290,13 @@ async def main():
     async def no_cues(segments, m): return []
     bot.download_video_stream = fake_video; bot.extract_frames = fake_frames; bot.find_screen_cues = no_cues
     bot._anthropic_client, captured = fake_client(fake_message(note_text))
-    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    await bot.process_item(SRC, 7, ctx)
     assert calls == [] and status().startswith("Done") and "Screenshots" not in status(), (calls, status())
     # with a picked moment: video stream + frame at that moment, Claude receives the image, message counts it
     async def one_cue(segments, m): return [(12.0, "the code")]
     bot.find_screen_cues = one_cue
     bot._anthropic_client, captured = fake_client(fake_message(note_text))
-    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    await bot.process_item(SRC, 7, ctx)
     assert calls == ["video", ("frames", [(12.0, "the code")])], calls
     assert "\nScreenshots — 1\n" in status() and status().startswith("Done"), status()
     assert any(c["type"] == "image" for c in captured["messages"][0]["content"])
@@ -287,9 +304,9 @@ async def main():
     def broken_frames(vp, m, out_dir, cues): raise RuntimeError("ffmpeg missing")
     bot.extract_frames = broken_frames
     bot._anthropic_client, captured = fake_client(fake_message(note_text))
-    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    await bot.process_item(SRC, 7, ctx)
     assert status().startswith("Done") and "Screenshots" not in status(), status()
-    assert (v / "A Talk (5).md").exists()
+    assert (NOTES / "A Talk (5).md").exists()
     bot.INCLUDE_FRAMES = False
     print("frames flow OK (Claude-gated, image sent, extraction failure tolerated)")
 
@@ -297,7 +314,7 @@ async def main():
     n_docs = len(docs)
     bot.SEND_NOTE_FILE = False
     bot._anthropic_client, _ = fake_client(fake_message(note_text))
-    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    await bot.process_item(SRC, 7, ctx)
     assert "\nNote saved: A Talk" in status() and status().startswith("Done") and len(docs) == n_docs, (status(), len(docs) - n_docs)
     bot.SEND_NOTE_FILE = True
     print("SEND_NOTE_FILE=false OK")
@@ -306,12 +323,12 @@ async def main():
     marker = pathlib.Path(os.environ["OBSIDIAN_VAULT_PATH"]) / "uploaded.txt"
     bot.AFTER_NOTE_COMMAND = f"cat {{path}} > {shlex.quote(str(marker))}"
     bot._anthropic_client, _ = fake_client(fake_message(note_text))
-    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    await bot.process_item(SRC, 7, ctx)
     assert marker.read_text() == note_text + "\n", marker.read_text()[:80]
-    assert "\nNote added to vault: A Talk" in status() and "failed" not in status(), status()
+    assert "\nNote added to vault: Knowledge/Testing/A Talk" in status() and "failed" not in status(), status()
     bot.AFTER_NOTE_COMMAND = "exit 3"
     bot._anthropic_client, _ = fake_client(fake_message(note_text))
-    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    await bot.process_item(SRC, 7, ctx)
     assert "\nVault upload failed (exit 3)" in status() and "\nNote kept on the server: A Talk" in status(), status()
     assert docs[-1][2].startswith("A Talk"), docs[-1][2]   # the file was still delivered
     bot.AFTER_NOTE_COMMAND = ""
@@ -321,10 +338,76 @@ async def main():
     from telegram.error import NetworkError
     async def bad_send_document(**kw): raise NetworkError("boom")
     ctx.bot.send_document = bad_send_document
-    n_files = len(list(v.glob("A Talk*.md")))
-    await bot.process_video("dQw4w9WgXcQ", 7, ctx)
+    n_files = len(list(v.rglob("A Talk*.md")))
+    await bot.process_item(SRC, 7, ctx)
     assert status().startswith("Done") and "Sending the file failed: boom" in status(), status()
-    assert len(list(v.glob("A Talk*.md"))) == n_files + 1
+    assert len(list(v.rglob("A Talk*.md"))) == n_files + 1
+    ctx.bot.send_document = send_document
+
+    # fetch_x: thread context, quoted tweet, media downloads, title, date
+    payloads = {
+        "30": {"tweet": {"id": "30", "url": "https://x.com/alice/status/30", "text": "Third: the conclusion", "created_timestamp": 1699960000,
+                         "author": {"name": "Alice A", "screen_name": "alice"}, "replying_to_status": "20",
+                         "media": {"photos": [{"url": "https://pbs.twimg.com/media/abc.jpg?name=orig"}],
+                                   "videos": [{"url": "https://video.twimg.com/v.mp4", "duration": 12.5}]},
+                         "quote": {"text": "quoted words", "author": {"name": "Q", "screen_name": "quoter"}}}},
+        "20": {"tweet": {"id": "20", "text": "Second", "author": {"name": "Alice A", "screen_name": "alice"}, "replying_to_status": "10"}},
+        "10": {"tweet": {"id": "10", "text": "First", "author": {"name": "Alice A", "screen_name": "alice"}, "replying_to_status": None}},
+    }
+    bot._http_get_json = lambda url: payloads[url.rsplit("/", 1)[1]]
+    downloaded = []
+    def fake_dl(url, dest): dest.write_bytes(b"data"); downloaded.append(dest.name); return dest
+    bot._download_file = fake_dl
+    x = bot.fetch_x("30", pathlib.Path(tempfile.mkdtemp()))
+    assert x.kind == "x" and x.handle == "alice" and x.channel == "Alice A" and x.title == "@alice: Third: the conclusion", x
+    assert x.text.startswith("Earlier tweets in this thread, oldest first:\n@alice (Alice A): First\n\n@alice (Alice A): Second"), x.text
+    assert "This tweet:\n@alice (Alice A): Third: the conclusion" in x.text and x.text.endswith("Quoted tweet:\n@quoter (Q): quoted words"), x.text
+    assert downloaded == ["photo_00.jpg", "video.mp4"] and len(x.images) == 1 and x.video_path.name == "video.mp4" and x.audio_path == x.video_path
+    assert x.duration_seconds == 12 and x.published == "2023-11-14" and x.url == "https://x.com/alice/status/30", (x.duration_seconds, x.published)
+    bot._http_get_json = lambda url: {"message": "NOT_FOUND"}
+    try:
+        bot.fetch_x("404", pathlib.Path(tempfile.mkdtemp())); raise AssertionError("no error")
+    except bot.PipelineError as e:
+        assert "NOT_FOUND" in str(e), e
+    print("fetch_x OK")
+
+    # fetch_instagram: parses what gallery-dl leaves behind; a login failure gets the cookies hint
+    d = pathlib.Path(tempfile.mkdtemp()); fake_gdl = d / "gallery-dl"
+    fake_gdl.write_text("#!/bin/sh\nexit 0\n"); fake_gdl.chmod(0o755); bot.GALLERY_DL_BIN = str(fake_gdl)
+    out = d / "out"; out.mkdir()
+    (out / "1.jpg").write_bytes(b"i1"); (out / "2.jpg").write_bytes(b"i2")
+    (out / "1.jpg.json").write_text(json.dumps({"description": "Caption line one\nmore", "username": "insta_user", "fullname": "Insta User",
+                                                "date": "2025-06-01 10:00:00", "post_url": "https://www.instagram.com/p/ABC123/"}))
+    ig = bot.fetch_instagram("ABC123", "https://www.instagram.com/p/ABC123/", out)
+    assert ig.kind == "instagram" and ig.title == "Caption line one" and ig.channel == "Insta User" and ig.handle == "insta_user" and ig.published == "2025-06-01", ig
+    assert len(ig.images) == 2 and ig.audio_path is None and ig.text.startswith("Caption line one") and ig.duration_seconds == 0
+    fake_gdl.write_text("#!/bin/sh\necho '[instagram][error] login required' >&2\nexit 1\n")
+    empty = d / "empty"; empty.mkdir()
+    try:
+        bot.fetch_instagram("X", "https://www.instagram.com/p/X/", empty); raise AssertionError("no error")
+    except bot.PipelineError as e:
+        assert "login required" in str(e) and "cookies" in str(e), e
+    print("fetch_instagram OK")
+
+    # an X post with an image and no video through the whole flow: no transcription, the image reaches Claude,
+    # the post template is used, the note is filed
+    img_dir = pathlib.Path(tempfile.mkdtemp()); (img_dir / "photo_00.jpg").write_bytes(b"\xff\xd8pic")
+    x_item = bot.Item(video_id="30", url="https://x.com/alice/status/30", title="@alice: Third", channel="Alice A", published="2023-11-14",
+                      duration_seconds=0, description="Third", kind="x", handle="alice", text="This tweet:\n@alice (Alice A): Third",
+                      images=[img_dir / "photo_00.jpg"])
+    bot.fetch_x = lambda tid, out_dir: x_item
+    transcribed = []
+    bot.transcribe_audio = lambda p, vid: transcribed.append(p) or []
+    bot._anthropic_client, captured = fake_client(fake_message(note_text))
+    await bot.process_item(bot.Source("x", "30", "https://x.com/i/status/30"), 7, ctx)
+    assert status() == "Done\n@alice: Third\n\nDownloaded\nImages — 1\nFiled under Knowledge/Testing\nNote saved: @alice Third", status()
+    assert transcribed == [] and (NOTES / "@alice Third.md").read_text() == note_text + "\n"
+    content = captured["messages"][0]["content"]
+    assert [c["type"] for c in content] == ["text", "text", "image", "text"] and content[1]["text"] == "Image 1 (image attached to the post):", content[:2]
+    body = content[-1]["text"]
+    assert "POST TEXT" in body and "@alice (Alice A): Third" in body and "type: post-note" in body and "Platform: X" in body and "(no audio)" in body, body[:400]
+    bot.transcribe_audio = fake_transcribe
+    print("x post flow OK")
     shutil.rmtree(v)
     print("send_document failure path OK")
     print("ALL STUB TESTS PASSED")

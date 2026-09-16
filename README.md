@@ -1,18 +1,21 @@
 # yt2obsidian
 
-Send a YouTube link to a Telegram bot; get a structured Obsidian note in your vault, without
-watching the video.
+Send a YouTube, Instagram, or X link to a Telegram bot; get a structured Obsidian note filed
+into the right folder of your vault, without watching or reading the original.
 
 ```
-YouTube URL ──▶ audio (yt-dlp) ──▶ transcript (Whisper) ──▶ screenshots of the moments that
-matter (Claude picks them) ──▶ note (Claude) ──▶ .md in your vault (or in the chat)
+link ──▶ download (yt-dlp / gallery-dl / FixTweet) ──▶ transcript (Whisper) ──▶ screenshots of
+the moments that matter (Claude picks them) ──▶ note (Claude) ──▶ folder (Claude picks it)
+──▶ .md in your vault (or in the chat)
 ```
 
-The note is built to replace watching: a summary, key takeaways, notes organised by topic with
-links back to the exact moment in the video, code and slide text pulled from screenshots,
-things worth following up, quotes, wikilinks into your vault, and the full timestamped
-transcript folded at the bottom so the whole video is searchable. See
+For a video the note is built to replace watching: a summary, key takeaways, notes organised
+by topic with links back to the exact moment in the video, code and slide text pulled from
+screenshots, things worth following up, quotes, wikilinks into your vault, and the full
+timestamped transcript folded at the bottom so the whole video is searchable. See
 [`examples/Rust in 100 Seconds.md`](examples/Rust%20in%20100%20Seconds.md) for a real one.
+An Instagram post, a reel, or a tweet gets a shorter note: the author's own words, what the
+images show, and the takeaways.
 
 In Telegram the bot posts one status message per video and updates it in place:
 
@@ -26,7 +29,8 @@ Screenshots — 2
 Writing note…
 ```
 
-It ends as `Done` with `Note added to vault: …`, or `Failed` with the reason.
+It ends as `Done` with `Filed under Knowledge/Economics` and `Note added to vault: …`, or
+`Failed` with the reason.
 
 Everything is one Python file. It runs on a laptop or on a small always-on server (an AWS
 setup is included) and costs a few cents per video in API calls.
@@ -46,10 +50,13 @@ setup is included) and costs a few cents per video in API calls.
 
 ## How it works
 
-Each link goes through five steps, all in `bot.py`:
+Each link goes through six steps, all in `bot.py`:
 
-1. **Download.** yt-dlp fetches the audio-only stream and the video's metadata (title,
-   channel, chapters). Nothing is kept after the job.
+1. **Download.** For YouTube, yt-dlp fetches the audio-only stream and the video's metadata
+   (title, channel, chapters). For Instagram, gallery-dl fetches the post's images or the
+   reel's video plus the caption. For X, the FixTweet API returns the tweet's text, author,
+   media, quoted tweet, and the earlier tweets it replies to, with no account needed. Nothing
+   is kept after the job.
 2. **Transcribe.** Either locally with faster-whisper (`distil-large-v3`, int8, English
    only, no account needed) or through an OpenAI-compatible speech-to-text API (OpenAI or
    Groq), which is about 100 times faster. Segments keep their timestamps.
@@ -60,9 +67,10 @@ Each link goes through five steps, all in `bot.py`:
    a frame is grabbed at each moment, near-duplicates are dropped, and up to 30 frames go to
    the next step labelled with their timestamps. A talk with nothing on screen gets no
    screenshots and no video download.
-4. **Write the note.** Claude gets the transcript, the metadata, the chapters, and the frames,
-   plus a fixed template and a rule set, and writes the note. The rules that matter most,
-   all learned from testing across genres:
+4. **Write the note.** Claude gets the transcript, the post's own text, the metadata, the
+   chapters, the frames, and any attached images, plus a fixed template and a rule set, and
+   writes the note. Videos get the full template; posts, reels, and tweets get a short-form
+   one. The rules that matter most, all learned from testing across genres:
    - Notes are organised by topic, not by time: each section is a concept, step, or argument,
      bullets lead with the key point in bold, details nest under it.
    - Timestamp links go on section headings, quotes, and on-screen references only.
@@ -72,12 +80,19 @@ Each link goes through five steps, all in `bot.py`:
      examples are kept; on-screen references that could not be captured are flagged.
    - Wikilinks only for entities you would want a note about, plus a Related section of
      broader topics, so notes connect over time.
-5. **Deliver.** The note is written to a folder, optionally pushed anywhere by a shell command
-   (for example `aws s3 cp` into a bucket your vault syncs from), and optionally attached to
-   the chat as a file.
+5. **File.** Claude sees the folders that already exist in the vault and picks the one the
+   note belongs in, or names a new topic folder under `Knowledge/` (for example
+   `Knowledge/Crypto trading`, `Knowledge/Programming`). Existing project folders are used
+   only when a note is clearly about that project; new folders never go anywhere else. The
+   pick is normalised in code, so a bad answer lands in `Knowledge/Inbox` rather than
+   somewhere odd.
+6. **Deliver.** The note is written under that folder, optionally pushed anywhere by a shell
+   command (for example `aws s3 cp` into a bucket your vault syncs from, keeping the folder),
+   and optionally attached to the chat as a file.
 
-Everything Claude-facing is a constant at the top of `bot.py`: `NOTE_TEMPLATE`,
-`SYSTEM_PROMPT`, `USER_PROMPT` (the note), and `CUE_PROMPT` (screenshot selection).
+Everything Claude-facing is a constant at the top of `bot.py`: `NOTE_TEMPLATE` and
+`POST_TEMPLATE`, `SYSTEM_PROMPT`, `USER_PROMPT` (the note), `CUE_PROMPT` (screenshot
+selection), and `FILE_PROMPT` (filing).
 
 ## Layout
 
@@ -151,7 +166,10 @@ All settings live in `.env` (see `.env.example`). Only the first two are require
 | `TELEGRAM_ALLOWED_USER_IDS` | empty (anyone) | Comma-separated Telegram user ids allowed to use the bot. Send `/start` to learn yours. |
 | `OBSIDIAN_VAULT_PATH` | `notes/` next to `bot.py` | Folder where every note is written. Point it inside your vault if the bot runs on the machine that has the vault. |
 | `SEND_NOTE_FILE` | `true` | Attach the finished `.md` to the chat. Set `false` once the vault syncs by itself. |
-| `AFTER_NOTE_COMMAND` | empty | Shell command run after each note, `{path}` replaced by the file. Typically an upload, e.g. `aws s3 cp {path} s3://my-vault/YouTube/`. |
+| `AFTER_NOTE_COMMAND` | empty | Shell command run after each note; `{path}` is the file, `{relpath}` its path inside the vault including the folder, `{folder}` the folder alone. Typically an upload, e.g. `aws s3 cp {path} s3://my-vault/{relpath}`. |
+| `KNOWLEDGE_ROOT` | `Knowledge` | Where new topic folders are created. |
+| `VAULT_LIST_COMMAND` | empty | Prints the vault's file paths (one per line; `aws s3 ls --recursive` output works) so the bot sees the existing folders when the vault is not on this machine. Empty: the folders under `OBSIDIAN_VAULT_PATH`. |
+| `GALLERY_DL_BIN` | next to the Python interpreter | Path to `gallery-dl` (Instagram) if it is elsewhere. |
 | `CLAUDE_MODEL` | `claude-sonnet-5` | Model that writes the note. |
 | `NOTE_BACKEND` | `api` | `api` (Anthropic API, metered) or `claude-code` (the Claude Code CLI on this machine with a Pro/Max subscription); see [Running on a Claude subscription](#running-on-a-claude-subscription-instead-of-the-api). |
 | `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_BIN` | | Token from `claude setup-token`; path to the `claude` binary if not on PATH. Only for `NOTE_BACKEND=claude-code`. |
@@ -164,7 +182,22 @@ All settings live in `.env` (see `.env.example`). Only the first two are require
 | `FRAMES_MAX`, `FRAMES_VIDEO_HEIGHT` | `30`, `720` | Most screenshots per video; resolution of the video stream fetched for them. |
 | `INCLUDE_TRANSCRIPT` | `true` | Append the full timestamped transcript in a folded section. |
 | `MAX_VIDEO_MINUTES` | `0` (no limit) | Refuse longer videos. |
-| `YTDLP_COOKIES_FILE` | empty | Netscape-format cookies file for YouTube; needed on most cloud servers, see below. |
+| `YTDLP_COOKIES_FILE` | empty | Netscape-format cookies file; needed for YouTube on most cloud servers and always for Instagram. One file can hold both sites' cookies. |
+
+## Instagram and X
+
+- **X (Twitter):** any public tweet works with no account, via the FixTweet API. The note
+  includes the tweet, the earlier tweets it replies to (so a thread read from its last tweet
+  keeps its context), a quoted tweet, attached photos (read by Claude), and an attached video
+  (transcribed, with screenshots). Replies *below* the linked tweet are not fetched, so link
+  the last tweet of a thread you want whole.
+- **Instagram:** posts, carousels, and reels through gallery-dl, which needs the cookies of a
+  logged-in Instagram session in `YTDLP_COOKIES_FILE` (export them the same way as the
+  YouTube cookies, from a private window logged into both sites, into one file). Reels are
+  transcribed like videos; image posts go to Claude as images with the caption.
+- Both get the short-form note (`POST_TEMPLATE`): the author's words, what the images show
+  where it matters, and the takeaways. Timestamps in a reel's transcript link to the post
+  itself, since those platforms have no jump-to-second links.
 
 ## Deploy on AWS (EC2)
 
@@ -275,19 +308,22 @@ note to the bucket; your devices pull it into the vault. Storage costs cents per
    run `aws configure` with the key and the bucket's region, then in `.env`:
 
    ```bash
-   AFTER_NOTE_COMMAND=aws s3 cp {path} s3://my-vault/YouTube/
+   AFTER_NOTE_COMMAND=aws s3 cp {path} s3://my-vault/{relpath}
+   VAULT_LIST_COMMAND=aws s3 ls s3://my-vault --recursive
    SEND_NOTE_FILE=false
    ```
 
-   Restart the bot. A failed upload is reported in the status message; the note stays on
-   the server.
+   The first line uploads each note into its folder; the second lets the bot see the vault's
+   folders when filing. Restart the bot. A failed upload is reported in the status message;
+   the note stays on the server.
 3. **Devices.** In Obsidian, install Remotely Save, choose S3, enter the endpoint
    `https://s3.<region>.amazonaws.com`, the region, the access key and secret, and the bucket
-   name; run a sync; turn on auto sync. Notes appear under `YouTube/`.
+   name; run a sync; turn on auto sync. Notes appear under `Knowledge/<Topic>/`.
 
 Remotely Save also speaks Dropbox, OneDrive, Google Drive, and WebDAV; with
 [rclone](https://rclone.org/) on the server the same one-liner works for those, e.g.
-`AFTER_NOTE_COMMAND=rclone copy {path} dropbox:Vault/YouTube`.
+`AFTER_NOTE_COMMAND=rclone copyto {path} dropbox:Vault/{relpath}` and
+`VAULT_LIST_COMMAND=rclone lsf -R --files-only dropbox:Vault`.
 
 **Option B: [Syncthing](https://syncthing.net/), free and peer-to-peer.** Run Syncthing on
 the server (`sudo apt install syncthing`, `sudo systemctl enable --now syncthing@$USER`, web UI

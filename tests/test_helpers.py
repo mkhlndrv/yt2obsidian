@@ -1,6 +1,7 @@
-import os, sys
-os.environ.update(TELEGRAM_BOT_TOKEN="x", ANTHROPIC_API_KEY="x", OBSIDIAN_VAULT_PATH=__import__("tempfile").mkdtemp(prefix="yt2obsidian-test-"))
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+import os, sys, pathlib, tempfile
+os.environ.update(TELEGRAM_BOT_TOKEN="x", ANTHROPIC_API_KEY="x", OBSIDIAN_VAULT_PATH=tempfile.mkdtemp(prefix="yt2obsidian-test-"))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+import shlex
 import bot
 
 # --- extract_video_id --------------------------------------------------------
@@ -52,11 +53,65 @@ assert "{topic-tag}" in tpl and "{title}" not in tpl and "{url}" not in tpl
 print("render_template OK")
 
 # USER_PROMPT formatting must not choke on braces inside the template
-prompt = bot.USER_PROMPT.format(template=tpl, title=meta.title, channel=meta.channel, url=meta.url,
+prompt = bot.USER_PROMPT.format(template=tpl, platform="YouTube", title=meta.title, channel=meta.channel, url=meta.url,
                                 published=meta.published, duration=meta.duration_str, chapters="(none provided)",
-                                description=meta.description, transcript="blah")
+                                description=meta.description, post_text="(none)", transcript="blah")
 assert "{placeholder}" in prompt and "{topic-tag}" in prompt and "{timestamp link}" in prompt
+assert "platform: youtube" in tpl and "  - youtube" in tpl
 print("USER_PROMPT.format OK")
+
+# --- sources: YouTube, Instagram, X --------------------------------------------
+S = bot.parse_source
+assert S("https://youtu.be/dQw4w9WgXcQ") == bot.Source("youtube", "dQw4w9WgXcQ", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+assert S("look https://www.instagram.com/reel/C9xYzAbCdEf/?igsh=abc") == bot.Source("instagram", "C9xYzAbCdEf", "https://www.instagram.com/p/C9xYzAbCdEf/")
+assert S("https://instagram.com/p/DAbC_dE-fGh/").id == "DAbC_dE-fGh"
+assert S("https://www.instagram.com/someuser/reels/C1234567890/").id == "C1234567890"
+assert S("https://x.com/jack/status/20?s=20") == bot.Source("x", "20", "https://x.com/i/status/20")
+assert S("https://twitter.com/jack/status/20").id == "20" and S("https://mobile.twitter.com/a_b/statuses/123").id == "123"
+assert S("https://fxtwitter.com/jack/status/20").kind == "x"
+assert S("https://x.com/jack") is None and S("https://instagram.com/someuser/") is None and S("hello") is None
+assert S("https://www.youtube.com/watch?v=dQw4w9WgXcQ and https://x.com/jack/status/20").kind == "youtube"
+print("parse_source OK")
+
+T = bot._title_from_text
+assert T("  Hello world!  \nsecond line", "fb") == "Hello world!"
+assert T("Check this https://t.co/abc out", "fb") == "Check this out"
+assert T("", "fallback") == "fallback" and T("https://t.co/only", "fallback") == "fallback"
+long = T("word " * 40, "fb", limit=30)
+assert long.endswith("…") and len(long) <= 32, long
+print("_title_from_text OK")
+
+x_item = bot.Item(video_id="20", url="https://x.com/jack/status/20", title="t", channel="jack", published="2006-03-21",
+                  duration_seconds=0, description="", kind="x", handle="jack")
+assert bot.timestamp_link(x_item, 65) == "[1:05](https://x.com/jack/status/20)"
+assert bot.timestamp_link(meta, 65) == "[1:05](https://youtu.be/dQw4w9WgXcQ?t=65)"
+assert x_item.platform == "X" and meta.platform == "YouTube" and bot.template_for(x_item) is bot.POST_TEMPLATE and bot.template_for(meta) is bot.NOTE_TEMPLATE
+xt = bot.render_template(x_item)
+assert 'author: "jack"' in xt and "platform: x" in xt and "type: post-note" in xt and "{topic-tag}" in xt
+print("Item / template_for OK")
+
+# --- filing --------------------------------------------------------------------
+listing = ["2026-09-04 21:16:32       9024 Projects/F1 driver vs car/F1 Twitter Plan.md",
+           "2026-09-04 21:16:32      12452 Knowledge/Crypto trading/x.md", "Home.md", ".obsidian/app.json",
+           "Life/note.md", "", "Knowledge/Programming/sub/deep.md"]
+assert bot.folders_from_listing(listing) == ["Knowledge", "Knowledge/Crypto trading", "Knowledge/Programming",
+                                             "Knowledge/Programming/sub", "Life", "Projects", "Projects/F1 driver vs car"], bot.folders_from_listing(listing)
+existing = ["Knowledge", "Knowledge/Crypto trading", "Life", "Projects", "Projects/Football scouting"]
+N = lambda f: bot.normalize_folder(f, existing)
+assert N("Knowledge/Crypto trading") == "Knowledge/Crypto trading"
+assert N("knowledge/crypto Trading") == "Knowledge/Crypto trading"          # existing spelling wins
+assert N("Projects/Football scouting") == "Projects/Football scouting"     # existing project folder allowed
+assert N("Projects/New thing") == "Knowledge/New thing"                    # new folders only under the root
+assert N("Crypto trading") == "Knowledge/Crypto trading" and N("Economics") == "Knowledge/Economics"
+assert N("Knowledge/Programming/Rust") == "Knowledge/Programming"          # two levels max
+assert N("Knowledge") == "Knowledge/Inbox" and N("") == "Knowledge/Inbox" and N("Home") == "Knowledge/Inbox"
+assert N('Knowledge/Bad: "name"/x') == "Knowledge/Bad name"
+print("folders_from_listing / normalize_folder OK")
+
+imgs = [pathlib.Path(tempfile.mkdtemp()) / "a.jpg"]; imgs[0].write_bytes(b"img")
+assert bot.images_as_frames(imgs) == [(-1, "image attached to the post", b"img")]
+assert bot._frame_label(meta, -1, "w") == "Image 1 (w):" and bot._frame_label(meta, 12, "w").startswith("Frame at [0:12]")
+print("images_as_frames OK")
 
 # --- timestamps / transcript formatting --------------------------------------
 assert bot.format_timestamp(65) == "1:05" and bot.format_timestamp(3725) == "1:02:05"
@@ -126,12 +181,23 @@ e = yt_dlp.utils.DownloadError("ERROR: [youtube] abcdefghijk: Video unavailable.
 assert bot._clean_ytdlp_error(e) == "Video unavailable. This video is private", bot._clean_ytdlp_error(e)
 print("_clean_ytdlp_error OK")
 
-# --- write_note uniqueness ----------------------------------------------------
-import pathlib, shutil
+# --- write_note uniqueness and folders ----------------------------------------
+import shutil
 v = pathlib.Path(os.environ["OBSIDIAN_VAULT_PATH"]); shutil.rmtree(v, ignore_errors=True); v.mkdir()
 p1 = bot.write_note("note1\n", meta); p2 = bot.write_note("note2\n", meta); p3 = bot.write_note("note3\n", meta)
 assert p1.name == "He said hi a talk.md" and p2.name == "He said hi a talk (2).md" and p3.name == "He said hi a talk (3).md", (p1, p2, p3)
 assert p1.read_text() == "note1\n"
+p4 = bot.write_note("note4\n", meta, "Knowledge/Crypto trading")
+assert p4 == v / "Knowledge" / "Crypto trading" / "He said hi a talk.md" and p4.read_text() == "note4\n"
+assert bot.list_vault_folders() == ["Knowledge", "Knowledge/Crypto trading"]
+# AFTER_NOTE_COMMAND placeholders: {path}, {relpath}, {folder}
+out = v / "hook.txt"
+bot.AFTER_NOTE_COMMAND = f"printf '%s|%s|%s' {{path}} {{relpath}} {{folder}} > {shlex.quote(str(out))}"
+bot.run_after_note_command(p4)
+assert out.read_text() == f"{p4}|Knowledge/Crypto trading/He said hi a talk.md|Knowledge/Crypto trading", out.read_text()
+bot.run_after_note_command(p1)
+assert out.read_text() == f"{p1}|He said hi a talk.md|", out.read_text()
+bot.AFTER_NOTE_COMMAND = ""
 shutil.rmtree(v)
-print("write_note OK")
+print("write_note / folders / placeholders OK")
 print("ALL HELPER TESTS PASSED")
