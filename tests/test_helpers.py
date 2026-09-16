@@ -204,6 +204,11 @@ assert bot.ensure_topic_note("Projects/Football scouting") is None              
 linked = bot.link_note_to_topic('---\ntitle: "x"\n---\n# X\n\n## Related\n- [[Other]]\n\n## Source\n- v\n', "Crypto trading")
 assert linked == '---\ntitle: "x"\ntopic: "[[Crypto trading]]"\n---\n# X\n\n## Related\n- [[Crypto trading]]\n- [[Other]]\n\n## Source\n- v\n', linked
 assert bot.link_note_to_topic(linked, "Crypto trading") == linked                 # idempotent
+# Claude's own entry for the topic, even capitalised differently or aliased, is folded into the one canonical entry
+dup = '---\nt: x\n---\n# X\n\n## Related\n- [[Other]]\n- [[Crypto Trading]]\n- [[crypto trading|memecoins]]\n\n## Source\n- v\n'
+assert bot.link_note_to_topic(dup, "Crypto trading") == '---\nt: x\ntopic: "[[Crypto trading]]"\n---\n# X\n\n## Related\n- [[Crypto trading]]\n- [[Other]]\n\n## Source\n- v\n', bot.link_note_to_topic(dup, "Crypto trading")
+last = bot.link_note_to_topic("# X\n\n## Related\n- [[Crypto Trading]]\n- [[Other]]\n", "Crypto trading")   # Related as the last section
+assert last == "# X\n\n## Related\n- [[Crypto trading]]\n- [[Other]]\n", last
 no_related = bot.link_note_to_topic("---\na: b\n---\n# X\n- x\n\n## Transcript\n> t\n", "Programming")
 assert no_related == '---\na: b\ntopic: "[[Programming]]"\n---\n# X\n- x\n\n## Related\n- [[Programming]]\n\n## Transcript\n> t\n', no_related
 assert bot.link_note_to_topic("# plain\n", "T") == "# plain\n\n## Related\n- [[T]]\n"

@@ -1482,9 +1482,13 @@ def link_note_to_topic(note: str, topic: str) -> str:
             note = note[:end] + f'\ntopic: "{link}"' + note[end:]
     if "\n## Related\n" in note:
         head, _sep, rest = note.partition("\n## Related\n")
-        if link not in rest.split("\n## ", 1)[0]:
-            note = head + "\n## Related\n" + f"- {link}\n" + rest
-        return note
+        section, sep, tail = rest.partition("\n## ")
+        # Claude may have listed the topic itself, possibly capitalised differently; Obsidian resolves links
+        # case-insensitively, so that would be the same page twice. Keep one canonical entry, first.
+        own = re.compile(r"^\s*[-*]\s*\[\[" + re.escape(topic) + r"(\|[^\]]*)?\]\]\s*$", re.IGNORECASE)
+        kept = [line for line in section.splitlines() if not own.match(line)]
+        section = "\n".join([f"- {link}", *kept]) + ("\n" if section.endswith("\n") else "")
+        return head + "\n## Related\n" + section + sep + tail
     block = f"\n## Related\n- {link}\n"
     cut = note.find("\n## Transcript")
     return (note[:cut].rstrip() + "\n" + block + note[cut:]) if cut != -1 else note.rstrip() + "\n" + block
