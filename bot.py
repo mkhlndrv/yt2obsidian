@@ -1920,7 +1920,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(on_error)
 
-    log.info("Bot is running. Send it a YouTube link.")
+    log.info("Bot is running. Send it a YouTube, Instagram, or X link.")
     # bootstrap_retries=-1: keep retrying the first Telegram call instead of dying
     # when the network is briefly unavailable (e.g. right after boot).
     app.run_polling(allowed_updates=Update.ALL_TYPES, bootstrap_retries=-1)
